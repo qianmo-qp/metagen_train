@@ -10,6 +10,9 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
 
+# Disable torch._dynamo to avoid ONNX import issues
+os.environ['TORCH_DISABLE_DYNANMO'] = '1'
+
 from dit_model import ConditionalDiT
 from diffusion import create_diffusion
 
@@ -161,8 +164,21 @@ class Trainer:
 
 def main():
     # Setup
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    # Check CUDA availability
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        device = 'cuda'
+        print(f"✅ CUDA is available")
+        print(f"   Device: {torch.cuda.get_device_name(0)}")
+        print(f"   Compute Capability: {torch.cuda.get_device_capability(0)}")
+        print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        device = 'cpu'
+        print(f"⚠️  CUDA not detected, using CPU")
+        print(f"   To use GPU, ensure NVIDIA drivers and CUDA are installed")
+        print(f"   Run: nvidia-smi (to check GPU)")
+    
+    print(f"\nUsing device: {device}")
     
     # Hyperparameters
     num_epochs = 10
