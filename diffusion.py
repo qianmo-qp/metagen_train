@@ -186,21 +186,15 @@ class DiffusionSchedule:
         if clip_denoised:
             x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
         
-        # For DDIM, we need to compute the direction (simplified version)
-        # x_prev = sqrt(alpha_prev) * x_0 + sqrt(1 - alpha_prev - sigma^2) * noise_direction
-        # where noise_direction points from x_t towards x_0 via x_t - sqrt(1-alpha) * predicted_noise
+        # DDIM: x_prev = sqrt(alpha_prev) * x_0 + sqrt(1 - alpha_prev) * direction
+        # where direction = (x_t - sqrt(alpha_t) * x_0) / sqrt(1 - alpha_t)
+        direction = (x_t - sqrt_alpha_t * x_0_pred) / sqrt_one_minus_alpha_t
         
-        # Simplified DDIM: just use the prediction directly scaled
-        direction = predicted_noise
-        
-        # Compute stochastic term variance
-        sigma = eta * torch.sqrt((1.0 - alpha_t) / alpha_t * (1.0 - torch.sqrt(alpha_t) / torch.sqrt(alpha_t)))
-        
-        # Add small noise for stochasticity if eta > 0
+        # Add noise for stochasticity if eta > 0
         noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
         
-        # Simplified DDIM step: move towards x_0
-        x_prev = x_0_pred + torch.sqrt(1.0 - alpha_t).view(-1, 1, 1, 1) * direction * 0.5 + sigma * noise
+        # Simplified DDIM step
+        x_prev = x_0_pred + sqrt_one_minus_alpha_t * direction + eta * noise
         
         return x_prev
     
