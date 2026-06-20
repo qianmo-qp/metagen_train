@@ -1,20 +1,30 @@
 """
-Training loop for Conditional DiT on MNIST.
+Training loop for Conditional DiT on MNIST with W&B monitoring.
 """
 
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from pathlib import Path
+import subprocess
+import logging
 
 # Disable torch._dynamo to avoid ONNX import issues
 os.environ['TORCH_DISABLE_DYNANMO'] = '1'
 
+# Setup W&B
+os.environ["WANDB_API_KEY"] = "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"
+import wandb
+
 from dit_model import ConditionalDiT
 from diffusion import create_diffusion
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 
 
 def load_mnist_idx(filepath):
@@ -70,6 +80,8 @@ class Trainer:
         batch_size=128,
         checkpoint_dir='checkpoints',
         log_interval=100,
+        use_wandb=False,
+        sample_interval=10,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -78,6 +90,8 @@ class Trainer:
         self.batch_size = batch_size
         self.checkpoint_dir = checkpoint_dir
         self.log_interval = log_interval
+        self.use_wandb = use_wandb
+        self.sample_interval = sample_interval
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
         self.loss_fn = nn.MSELoss()
@@ -87,6 +101,7 @@ class Trainer:
         
         self.step = 0
         self.losses = []
+        self.logger = logging.getLogger(__name__)
     
     def train_epoch(self, train_loader):
         """Train for one epoch."""
@@ -123,6 +138,15 @@ class Trainer:
             if (batch_idx + 1) % self.log_interval == 0:
                 avg_loss = epoch_loss / (batch_idx + 1)
                 print(f"Step {self.step}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss:.6f}")
+                
+                # Log to W&B
+                if self.use_wandb:
+                    wandb.log({
+                        "loss": avg_loss,
+                        "step": self.step,
+                        "batch": batch_idx + 1,
+                        "epoch": int(self.step / len(train_loader)) + 1,
+                    }, step=self.step)
         
         return epoch_loss / len(train_loader)
     
@@ -145,6 +169,63 @@ class Trainer:
             torch.save(checkpoint, best_path)
             print(f"Saved best model to {best_path}")
     
+    def generate_samples(self, epoch):
+        """Generate samples and optionally log to W&B."""
+        import matplotlib.pyplot as plt
+        from PIL import Image
+        import io
+        
+        self.logger.info(f"Generating samples at epoch {epoch}...")
+        self.model.eval()
+        
+        # Generate 1 sample per class
+        class_labels = torch.arange(10, device=self.device)
+        x_t = torch.randn(10, 1, 28, 28, device=self.device)
+        
+        # Reverse diffusion
+        for t in reversed(range(self.diffusion.timesteps)):
+            t_tensor = torch.full((10,), t, dtype=torch.long, device=self.device)
+            with torch.no_grad():
+                x_t = self.diffusion.p_sample(self.model, x_t, t_tensor, class_labels, clip_denoised=True)
+        
+        # Denormalize
+        samples = (x_t + 1.0) / 2.0
+        samples = torch.clamp(samples, 0.0, 1.0)
+        
+        # Create grid image
+        fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+        axes = axes.flatten()
+        
+        for idx in range(10):
+            axes[idx].imshow(samples[idx, 0].cpu().numpy(), cmap='gray')
+            axes[idx].set_title(f'Class {idx}')
+            axes[idx].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save locally
+        sample_path = os.path.join('outputs', f'generated_samples_epoch_{epoch}.png')
+        Path('outputs').mkdir(exist_ok=True)
+        plt.savefig(sample_path, dpi=100, bbox_inches='tight')
+        self.logger.info(f"Saved samples to {sample_path}")
+        
+        # Log to W&B
+        if self.use_wandb:
+            # Convert to PIL Image for W&B
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            pil_image = Image.open(buf)
+            
+            wandb.log({
+                f"samples_epoch_{epoch}": wandb.Image(pil_image),
+                "epoch": epoch,
+            }, step=epoch)
+            self.logger.info(f"Logged samples to W&B for epoch {epoch}")
+        
+        plt.close()
+        self.model.train()
+    
     def train(self, train_loader):
         """Train for multiple epochs."""
         print(f"Training on {self.device}")
@@ -157,6 +238,21 @@ class Trainer:
             
             # Save checkpoint
             self.save_checkpoint(epoch + 1)
+            
+            # Generate samples every sample_interval epochs
+            if (epoch + 1) % self.sample_interval == 0:
+                self.logger.info(f"Sampling at epoch {epoch + 1}")
+                try:
+                    self.generate_samples(epoch + 1)
+                except Exception as e:
+                    self.logger.error(f"Error during sampling: {e}")
+            
+            # Log epoch metrics to W&B
+            if self.use_wandb:
+                wandb.log({
+                    "epoch_loss": avg_loss,
+                    "epoch": epoch + 1,
+                }, step=epoch + 1)
         
         print("\nTraining complete!")
         return self.losses
@@ -180,11 +276,30 @@ def main():
     
     print(f"\nUsing device: {device}")
     
+    # Initialize W&B
+    print("\n📊 Initializing W&B...")
+    wandb.init(
+        project='minst',
+        name='conditional_dit_mnist',
+        config={
+            'num_epochs': 100,
+            'batch_size': 128,
+            'learning_rate': 1e-4,
+            'timesteps': 1000,
+            'model_type': 'ConditionalDiT',
+            'hidden_dim': 192,
+            'num_layers': 6,
+            'num_heads': 3,
+        }
+    )
+    print("✅ W&B initialized")
+    
     # Hyperparameters
-    num_epochs = 10
+    num_epochs = 100  # 增加到100
     batch_size = 128
     learning_rate = 1e-4
     timesteps = 1000
+    sample_interval = 10  # 每10个epoch采样一次
     
     # Load MNIST
     print("Loading MNIST dataset...")
@@ -238,12 +353,18 @@ def main():
         num_epochs=num_epochs,
         batch_size=batch_size,
         log_interval=100,
+        use_wandb=True,  # 启用W&B
+        sample_interval=sample_interval,  # 每10个epoch采样
     )
     
     losses = trainer.train(train_loader)
     
     print(f"\nTraining complete! Final checkpoint saved.")
     print(f"Total steps: {trainer.step}")
+    
+    # 关闭W&B
+    wandb.finish()
+    print("\n📊 W&B run finished")
 
 
 if __name__ == "__main__":
