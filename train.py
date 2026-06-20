@@ -182,18 +182,16 @@ class Trainer:
         class_labels = torch.arange(10, device=self.device)
         x_t = torch.randn(10, 1, 28, 28, device=self.device)
         
-        # Reverse diffusion with progress indicator
-        # Sample every N steps for faster generation (quality still good)
-        sample_steps = 50  # Sample every 50th step (faster: 1000/50 = 20 steps instead of 1000)
-        timesteps = list(range(self.diffusion.timesteps - 1, -1, -sample_steps))
-        
-        for i, t in enumerate(timesteps):
-            if i % 5 == 0:  # Progress indicator
-                self.logger.info(f"  Sampling step {i+1}/{len(timesteps)}")
-            
+        # Reverse diffusion with FULL steps for high quality
+        # (use all 1000 steps, not just 20)
+        for t in reversed(range(self.diffusion.timesteps)):
             t_tensor = torch.full((10,), t, dtype=torch.long, device=self.device)
             with torch.no_grad():
                 x_t = self.diffusion.p_sample(self.model, x_t, t_tensor, class_labels, clip_denoised=True)
+            
+            # Progress indicator every 100 steps
+            if t % 100 == 0:
+                self.logger.info(f"  Sampling step {1000-t}/1000")
         
         # Denormalize
         samples = (x_t + 1.0) / 2.0
@@ -308,7 +306,7 @@ def main():
     batch_size = 128
     learning_rate = 1e-4
     timesteps = 1000
-    sample_interval = 10  # 每10个epoch采样一次
+    sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
     
     # Load MNIST
     print("Loading MNIST dataset...")
