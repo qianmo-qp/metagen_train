@@ -182,8 +182,15 @@ class Trainer:
         class_labels = torch.arange(10, device=self.device)
         x_t = torch.randn(10, 1, 28, 28, device=self.device)
         
-        # Reverse diffusion
-        for t in reversed(range(self.diffusion.timesteps)):
+        # Reverse diffusion with progress indicator
+        # Sample every N steps for faster generation (quality still good)
+        sample_steps = 50  # Sample every 50th step (faster: 1000/50 = 20 steps instead of 1000)
+        timesteps = list(range(self.diffusion.timesteps - 1, -1, -sample_steps))
+        
+        for i, t in enumerate(timesteps):
+            if i % 5 == 0:  # Progress indicator
+                self.logger.info(f"  Sampling step {i+1}/{len(timesteps)}")
+            
             t_tensor = torch.full((10,), t, dtype=torch.long, device=self.device)
             with torch.no_grad():
                 x_t = self.diffusion.p_sample(self.model, x_t, t_tensor, class_labels, clip_denoised=True)
@@ -209,7 +216,7 @@ class Trainer:
         plt.savefig(sample_path, dpi=100, bbox_inches='tight')
         self.logger.info(f"Saved samples to {sample_path}")
         
-        # Log to W&B
+        # Log to W&B with correct step counter
         if self.use_wandb:
             # Convert to PIL Image for W&B
             buf = io.BytesIO()
@@ -217,11 +224,12 @@ class Trainer:
             buf.seek(0)
             pil_image = Image.open(buf)
             
+            # Use monotonically increasing step (current step, not epoch)
             wandb.log({
                 f"samples_epoch_{epoch}": wandb.Image(pil_image),
                 "epoch": epoch,
-            }, step=epoch)
-            self.logger.info(f"Logged samples to W&B for epoch {epoch}")
+            }, step=self.step)  # ← 使用self.step而不是epoch!
+            self.logger.info(f"Logged samples to W&B for epoch {epoch} at step {self.step}")
         
         plt.close()
         self.model.train()
