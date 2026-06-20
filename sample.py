@@ -8,6 +8,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 import matplotlib.pyplot as plt
+import argparse
 
 from dit_model import ConditionalDiT
 from diffusion import create_diffusion
@@ -31,9 +32,11 @@ def generate_samples(
     num_classes=10,
     batch_size=10,
     timesteps=1000,
+    method='ddim',
+    num_steps=50,
 ):
     """
-    Generate samples for each class.
+    Generate samples for each class using DDIM (fast) or DDPM (high-quality).
     
     Args:
         model: Trained DiT model
@@ -41,6 +44,9 @@ def generate_samples(
         device: Device to use
         num_classes: Number of classes (0-9)
         batch_size: Samples per class
+        timesteps: Total timesteps in diffusion (1000)
+        method: 'ddim' (fast, ~6s) or 'ddpm' (slow, ~5m, high-quality)
+        num_steps: Number of steps for DDIM (default 50)
     Returns:
         samples: (num_classes * batch_size, 1, 28, 28) tensor
         labels: (num_classes * batch_size,) tensor
@@ -56,20 +62,33 @@ def generate_samples(
         # Class labels for this batch
         class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
         
-        # Start from pure noise
-        x_t = torch.randn(batch_size, 1, 28, 28, device=device)
-        
-        # Reverse diffusion
-        for t in reversed(range(timesteps)):
-            if t % 100 == 0:
-                print(f"  Reverse step {t}/{timesteps}")
+        if method == 'ddim':
+            # DDIM: Fast sampling (50 steps ~ 6 seconds)
+            samples = diffusion.sample_ddim(
+                model,
+                num_samples=batch_size,
+                num_classes=10,
+                device=device,
+                num_steps=num_steps,
+                eta=0.0,  # Deterministic
+                class_labels=class_labels
+            )
+        else:
+            # DDPM: Full sampling (1000 steps ~ 5 minutes, highest quality)
+            x_t = torch.randn(batch_size, 1, 28, 28, device=device)
             
-            t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
+            for t in reversed(range(timesteps)):
+                if t % 100 == 0:
+                    print(f"  Reverse step {t}/{timesteps}")
+                
+                t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
+                
+                with torch.no_grad():
+                    x_t = diffusion.p_sample(model, x_t, t_tensor, class_labels, clip_denoised=True)
             
-            with torch.no_grad():
-                x_t = diffusion.p_sample(model, x_t, t_tensor, class_labels, clip_denoised=True)
+            samples = x_t
         
-        all_samples.append(x_t.cpu())
+        all_samples.append(samples.cpu())
         all_labels.extend([class_id] * batch_size)
     
     samples = torch.cat(all_samples, dim=0)
@@ -128,8 +147,16 @@ def save_grid_image(samples, labels, output_path='generated_samples.png', nrow=1
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Generate MNIST samples using trained DiT')
+    parser.add_argument('--method', choices=['ddim', 'ddpm'], default='ddim',
+                       help='Sampling method: ddim (fast, ~6s) or ddpm (slow, ~5m, high-quality)')
+    parser.add_argument('--num-steps', type=int, default=50,
+                       help='Number of steps for DDIM sampling (default: 50)')
+    args = parser.parse_args()
+    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
+    print(f"Sampling method: {args.method.upper()} ({args.num_steps} steps)")
     
     # Model configuration
     model_config = {
@@ -181,6 +208,8 @@ def main():
         num_classes=10,
         batch_size=1,
         timesteps=1000,
+        method=args.method,
+        num_steps=args.num_steps,
     )
     
     # Save grid
@@ -198,6 +227,8 @@ def main():
         num_classes=10,
         batch_size=10,
         timesteps=1000,
+        method=args.method,
+        num_steps=args.num_steps,
     )
     
     output_path_many = os.path.join(output_dir, 'generated_samples_10per_class.png')

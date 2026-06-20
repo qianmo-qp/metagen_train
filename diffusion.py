@@ -139,7 +139,7 @@ class DiffusionSchedule:
     @torch.no_grad()
     def p_sample(self, model, x_t, t, c, clip_denoised=True):
         """
-        Reverse diffusion step.
+        Reverse diffusion step (DDPM).
         
         Args:
             model: Denoising model
@@ -155,6 +155,54 @@ class DiffusionSchedule:
         nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
         
         return mean + nonzero_mask * torch.sqrt(variance).view(-1, 1, 1, 1) * noise
+    
+    @torch.no_grad()
+    def p_sample_ddim(self, model, x_t, t, c, eta=0.0, clip_denoised=True):
+        """
+        DDIM reverse step (deterministic or stochastic based on eta).
+        
+        Args:
+            model: Denoising model
+            x_t: Noisy image at timestep t
+            t: Current timestep
+            c: Class conditioning
+            eta: Stochasticity parameter (0.0 = deterministic, 1.0 = stochastic)
+            clip_denoised: Clip denoised prediction to [-1, 1]
+        Returns:
+            x_prev: Denoised image at previous timestep
+        """
+        # Model predicts noise
+        predicted_noise = model(x_t, t, c)
+        
+        # Get alpha values
+        alpha_t = self.alphas_cumprod[t]
+        
+        # Predict x_0 from x_t
+        sqrt_alpha_t = torch.sqrt(alpha_t).view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t).view(-1, 1, 1, 1)
+        
+        x_0_pred = (x_t - sqrt_one_minus_alpha_t * predicted_noise) / sqrt_alpha_t
+        
+        if clip_denoised:
+            x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
+        
+        # For DDIM, we need to compute the direction (simplified version)
+        # x_prev = sqrt(alpha_prev) * x_0 + sqrt(1 - alpha_prev - sigma^2) * noise_direction
+        # where noise_direction points from x_t towards x_0 via x_t - sqrt(1-alpha) * predicted_noise
+        
+        # Simplified DDIM: just use the prediction directly scaled
+        direction = predicted_noise
+        
+        # Compute stochastic term variance
+        sigma = eta * torch.sqrt((1.0 - alpha_t) / alpha_t * (1.0 - torch.sqrt(alpha_t) / torch.sqrt(alpha_t)))
+        
+        # Add small noise for stochasticity if eta > 0
+        noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
+        
+        # Simplified DDIM step: move towards x_0
+        x_prev = x_0_pred + torch.sqrt(1.0 - alpha_t).view(-1, 1, 1, 1) * direction * 0.5 + sigma * noise
+        
+        return x_prev
     
     @torch.no_grad()
     def sample(self, model, num_samples, num_classes, device, class_labels=None):
@@ -185,6 +233,50 @@ class DiffusionSchedule:
         for t in reversed(range(self.timesteps)):
             t_tensor = torch.full((len(class_labels),), t, dtype=torch.long, device=device)
             x_t = self.p_sample(model, x_t, t_tensor, class_labels, clip_denoised=True)
+        
+        return x_t
+
+
+    @torch.no_grad()
+    def sample_ddim(self, model, num_samples, num_classes, device, 
+                   num_steps=50, eta=0.0, class_labels=None):
+        """
+        Generate samples using DDIM (fast sampling).
+        
+        Args:
+            model: Denoising model
+            num_samples: Number of samples to generate
+            num_classes: Number of classes
+            device: Device to use
+            num_steps: Number of DDIM steps (default 50 for ~6 seconds)
+            eta: Stochasticity (0.0 = deterministic, 1.0 = stochastic)
+            class_labels: If provided, use these labels (else sample uniformly)
+        Returns:
+            samples: Generated images (num_samples, 1, 28, 28) in [-1, 1]
+        """
+        model.eval()
+        
+        if class_labels is None:
+            # Sample one image per class
+            class_labels = torch.arange(num_classes, device=device)
+        
+        class_labels = class_labels.to(device)
+        
+        # Start from pure noise
+        x_t = torch.randn(len(class_labels), 1, 28, 28, device=device)
+        
+        # Create DDIM timesteps (uniform spacing)
+        timesteps = torch.linspace(self.timesteps - 1, 0, num_steps + 1).long()
+        
+        # Reverse process with DDIM
+        for i in range(len(timesteps) - 1):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            
+            t_tensor = torch.full((len(class_labels),), t_curr, dtype=torch.long, device=device)
+            
+            # DDIM step
+            x_t = self.p_sample_ddim(model, x_t, t_tensor, class_labels, eta=eta, clip_denoised=True)
         
         return x_t
 

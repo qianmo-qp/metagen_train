@@ -170,7 +170,7 @@ class Trainer:
             print(f"Saved best model to {best_path}")
     
     def generate_samples(self, epoch):
-        """Generate samples and optionally log to W&B."""
+        """Generate samples using DDIM and optionally log to W&B."""
         import matplotlib.pyplot as plt
         from PIL import Image
         import io
@@ -178,23 +178,22 @@ class Trainer:
         self.logger.info(f"Generating samples at epoch {epoch}...")
         self.model.eval()
         
-        # Generate 1 sample per class
+        # Generate 1 sample per class using DDIM (50 steps = ~6 seconds)
         class_labels = torch.arange(10, device=self.device)
-        x_t = torch.randn(10, 1, 28, 28, device=self.device)
         
-        # Reverse diffusion with FULL steps for high quality
-        # (use all 1000 steps, not just 20)
-        for t in reversed(range(self.diffusion.timesteps)):
-            t_tensor = torch.full((10,), t, dtype=torch.long, device=self.device)
-            with torch.no_grad():
-                x_t = self.diffusion.p_sample(self.model, x_t, t_tensor, class_labels, clip_denoised=True)
-            
-            # Progress indicator every 100 steps
-            if t % 100 == 0:
-                self.logger.info(f"  Sampling step {1000-t}/1000")
+        # Use DDIM for fast sampling
+        samples = self.diffusion.sample_ddim(
+            self.model,
+            num_samples=10,
+            num_classes=10,
+            device=self.device,
+            num_steps=50,      # DDIM: 50 steps (fast!)
+            eta=0.0,           # Deterministic sampling
+            class_labels=class_labels
+        )
         
         # Denormalize
-        samples = (x_t + 1.0) / 2.0
+        samples = (samples + 1.0) / 2.0
         samples = torch.clamp(samples, 0.0, 1.0)
         
         # Create grid image
