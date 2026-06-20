@@ -302,7 +302,7 @@ def main():
     print("✅ W&B initialized")
     
     # Hyperparameters
-    num_epochs = 100  # 增加到100
+    num_epochs = 400  # 增加到400获得更优的模型
     batch_size = 128
     learning_rate = 1e-4
     timesteps = 1000
