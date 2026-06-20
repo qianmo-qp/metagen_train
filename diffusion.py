@@ -157,7 +157,7 @@ class DiffusionSchedule:
         return mean + nonzero_mask * torch.sqrt(variance).view(-1, 1, 1, 1) * noise
     
     @torch.no_grad()
-    def p_sample_ddim(self, model, x_t, t, c, eta=0.0, clip_denoised=True):
+    def p_sample_ddim(self, model, x_t, t, t_next, c, eta=0.0, clip_denoised=True):
         """
         DDIM reverse step (deterministic or stochastic based on eta).
         
@@ -165,8 +165,9 @@ class DiffusionSchedule:
             model: Denoising model
             x_t: Noisy image at timestep t
             t: Current timestep
+            t_next: Next timestep (t-1)
             c: Class conditioning
-            eta: Stochasticity parameter (0.0 = deterministic, 1.0 = stochastic)
+            eta: Stochasticity parameter (0.0 = deterministic, 1.0 = stochastic LIKE DDPM)
             clip_denoised: Clip denoised prediction to [-1, 1]
         Returns:
             x_prev: Denoised image at previous timestep
@@ -176,6 +177,7 @@ class DiffusionSchedule:
         
         # Get alpha values
         alpha_t = self.alphas_cumprod[t]
+        alpha_next = self.alphas_cumprod[t_next] if t_next >= 0 else torch.ones_like(alpha_t)
         
         # Predict x_0 from x_t
         sqrt_alpha_t = torch.sqrt(alpha_t).view(-1, 1, 1, 1)
@@ -186,15 +188,21 @@ class DiffusionSchedule:
         if clip_denoised:
             x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
         
-        # DDIM: x_prev = sqrt(alpha_prev) * x_0 + sqrt(1 - alpha_prev) * direction
-        # where direction = (x_t - sqrt(alpha_t) * x_0) / sqrt(1 - alpha_t)
+        # DDIM variance schedule
+        sqrt_alpha_next = torch.sqrt(alpha_next).view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_next = torch.sqrt(1.0 - alpha_next).view(-1, 1, 1, 1)
+        
+        # Sigma calculation (controls stochasticity)
+        sigma = eta * torch.sqrt((1.0 - alpha_next) / (1.0 - alpha_t) * (1.0 - alpha_t / alpha_next)).view(-1, 1, 1, 1)
+        
+        # Direction from x_t to x_0
         direction = (x_t - sqrt_alpha_t * x_0_pred) / sqrt_one_minus_alpha_t
         
-        # Add noise for stochasticity if eta > 0
+        # Noise for stochasticity
         noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
         
-        # Simplified DDIM step
-        x_prev = x_0_pred + sqrt_one_minus_alpha_t * direction + eta * noise
+        # DDIM step: x_prev = sqrt(alpha_next) * x_0 + sqrt(1 - alpha_next - sigma^2) * direction + sigma * noise
+        x_prev = sqrt_alpha_next * x_0_pred + sqrt_one_minus_alpha_next * direction + sigma * noise
         
         return x_prev
     
@@ -259,8 +267,11 @@ class DiffusionSchedule:
         # Start from pure noise
         x_t = torch.randn(len(class_labels), 1, 28, 28, device=device)
         
-        # Create DDIM timesteps (uniform spacing)
-        timesteps = torch.linspace(self.timesteps - 1, 0, num_steps + 1).long()
+        # Create DDIM timesteps (more steps for better quality)
+        # Using stride to uniformly sample timesteps from 999 to 0
+        # Higher num_steps = higher quality but slower
+        stride = self.timesteps // num_steps  # Stride to skip timesteps
+        timesteps = torch.arange(self.timesteps - 1, -1, -stride, dtype=torch.long, device=device)
         
         # Reverse process with DDIM
         for i in range(len(timesteps) - 1):
@@ -268,9 +279,10 @@ class DiffusionSchedule:
             t_next = timesteps[i + 1].item()
             
             t_tensor = torch.full((len(class_labels),), t_curr, dtype=torch.long, device=device)
+            t_next_tensor = torch.full((len(class_labels),), t_next, dtype=torch.long, device=device)
             
             # DDIM step
-            x_t = self.p_sample_ddim(model, x_t, t_tensor, class_labels, eta=eta, clip_denoised=True)
+            x_t = self.p_sample_ddim(model, x_t, t_tensor, t_next_tensor, class_labels, eta=eta, clip_denoised=True)
         
         return x_t
 

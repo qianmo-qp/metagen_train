@@ -149,9 +149,9 @@ def save_grid_image(samples, labels, output_path='generated_samples.png', nrow=1
 def main():
     parser = argparse.ArgumentParser(description='Generate MNIST samples using trained DiT')
     parser.add_argument('--method', choices=['ddim', 'ddpm'], default='ddim',
-                       help='Sampling method: ddim (fast, ~6s) or ddpm (slow, ~5m, high-quality)')
-    parser.add_argument('--num-steps', type=int, default=50,
-                       help='Number of steps for DDIM sampling (default: 50)')
+                       help='Sampling method: ddim (fast, ~12s with 100 steps) or ddpm (slow, ~5m, highest quality)')
+    parser.add_argument('--num-steps', type=int, default=100,
+                       help='Number of steps for DDIM sampling (default: 100, recommended: 50-200)')
     args = parser.parse_args()
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

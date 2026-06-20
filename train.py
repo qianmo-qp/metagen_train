@@ -187,7 +187,7 @@ class Trainer:
             num_samples=10,
             num_classes=10,
             device=self.device,
-            num_steps=50,      # DDIM: 50 steps (fast!)
+            num_steps=100,     # DDIM: 100 steps (更好质量!)
             eta=0.0,           # Deterministic sampling
             class_labels=class_labels
         )
