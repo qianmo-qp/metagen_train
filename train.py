@@ -257,10 +257,11 @@ class Trainer:
             
             # Log epoch metrics to W&B
             if self.use_wandb:
+                # 不要用step参数,W&B会自动使用最后一个step
                 wandb.log({
                     "epoch_loss": avg_loss,
                     "epoch": epoch + 1,
-                }, step=epoch + 1)
+                })  # 移除step参数!
         
         print("\nTraining complete!")
         return self.losses
