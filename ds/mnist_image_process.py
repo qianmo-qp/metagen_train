@@ -213,12 +213,20 @@ class MNISTPhaseProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MNIST批量相位提取')
+    parser = argparse.ArgumentParser(
+        description='MNIST批量相位提取',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+示例:
+  python3 mnist_image_process.py                    # 使用默认路径
+  python3 mnist_image_process.py -r 128 -i 100    # 自定义分辨率和迭代次数
+  python3 mnist_image_process.py -md ./data/minst -od ./data/phase_output
+        ''')
     parser.add_argument('--mnist-dir', '-md', type=str, 
-                       default='/Users/qp/workspace/metagen_train/data/minst',
+                       default='./data/minst',
                        help='MNIST数据集目录')
     parser.add_argument('--output-dir', '-od', type=str,
-                       default='/Users/qp/workspace/metagen_train/data/minst_phase',
+                       default='./data/minst_phase',
                        help='输出目录')
     parser.add_argument('--resolution', '-r', type=int, default=256,
                        help='处理分辨率 (默认: 256)')

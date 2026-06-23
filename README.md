@@ -1,5 +1,126 @@
 # Conditional DiT for MNIST
 
+A clean PyTorch implementation of a Conditional Diffusion Transformer (DiT) for generating MNIST handwritten digits.
+
+## Project Structure
+
+```
+metagen_train/
+├── dit_model.py                # DiT architecture
+├── diffusion.py                # Diffusion process (DDPM + DDIM)
+├── train.py                    # Training loop with W&B monitoring
+├── sample.py                   # Generation/sampling
+├── data/minst/                 # MNIST dataset (IDX files)
+├── data/minst_phase/           # Phase hologram data (generated)
+├── ds/                         # Phase processing tools
+│   ├── phase_extractor.py      # PNG → phase_map.npy
+│   ├── phase_visualizer.py     # phase_map.npy → PNG
+│   └── mnist_image_process.py  # Batch MNIST → phase conversion
+├── checkpoints/                # Model checkpoints (auto-created)
+├── outputs/                    # Generated samples (auto-created)
+└── README_PHASE.md            # Phase processing guide
+```
+
+## Quick Start
+
+### Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+### Training
+
+```bash
+python train.py
+```
+
+- Loads MNIST (60K images)
+- Trains with DDPM (sampling monitoring uses fast DDIM)
+- Logs to W&B (set WANDB_API_KEY)
+- Saves checkpoints to `checkpoints/`
+
+### Sampling
+
+```bash
+python sample.py                     # DDIM (fast, 100 steps)
+python sample.py --method ddpm       # DDPM (slow, 1000 steps, highest quality)
+```
+
+Output: Generated digit samples in `outputs/`
+
+## Phase Hologram Processing
+
+Convert MNIST to optical phase holograms:
+
+```bash
+cd ds/
+
+# Single image extraction
+python3 phase_extractor.py image.png -o image_phase.npy
+
+# Batch MNIST processing
+python3 mnist_image_process.py
+
+# Visualization
+python3 phase_visualizer.py phase_map.npy --recovered -od /tmp/output
+```
+
+See `ds/README_PHASE.md` for detailed usage.
+
+## Model Architecture
+
+- **Input**: 28×28 MNIST images → 4×4 patches (49 tokens)
+- **Encoder**: 6-layer Transformer (192 hidden dim, 3 heads)
+- **Conditioning**: Time embedding + Class embedding (0-9)
+- **Output**: Noise prediction for reverse diffusion
+- **Parameters**: ~3.9M (lightweight, trains fast)
+
+## Key Features
+
+✅ Conditional generation (class-guided)  
+✅ DDPM training + DDIM fast sampling (50× speedup)  
+✅ W&B monitoring integration  
+✅ GPU/CPU/Mac compatible  
+✅ Modular phase processing tools  
+✅ Well-documented, clean code
+
+## Hyperparameters
+
+| Parameter | Value |
+|-----------|-------|
+| Image size | 28×28 |
+| Patch size | 4×4 |
+| Hidden dim | 192 |
+| Layers | 6 |
+| Attention heads | 3 |
+| Timesteps | 1000 |
+| Learning rate | 1e-4 |
+| Batch size | 128 |
+| Epochs | 400 |
+
+## Results
+
+After 400 epochs training:
+- Loss: ~0.078
+- Generated samples: Clear, recognizable digits
+- Sample quality: High with DDIM (100 steps) or DDPM (1000 steps)
+
+## Troubleshooting
+
+**Out of memory?** → Reduce batch_size in train.py
+
+**Slow training?** → Use GPU (set CUDA_VISIBLE_DEVICES)
+
+**Generation quality poor?** → Train longer or use DDPM sampling
+
+## References
+
+- DiT: Scalable Diffusion Models with Transformers (Peebles & Xie, 2023)
+- DDPM: Denoising Diffusion Probabilistic Models (Ho et al., 2020)
+- DDIM: Denoising Diffusion Implicit Models (Song et al., 2021)
+# Conditional DiT for MNIST
+
 A minimalist, clean PyTorch implementation of a Conditional Diffusion Transformer (DiT) for generating MNIST handwritten digits.
 
 ## Overview
