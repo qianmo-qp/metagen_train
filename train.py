@@ -27,46 +27,90 @@ from diffusion import create_diffusion
 logging.basicConfig(level=logging.INFO)
 
 
-def load_mnist_idx(filepath):
-    """Load MNIST IDX format files."""
-    with open(filepath, 'rb') as f:
-        # Read magic number and dimensions
-        magic = int.from_bytes(f.read(4), byteorder='big')
+def load_phase_data(data_dir='data/minst_phase'):
+    """
+    Load phase hologram data from .npy files.
+    
+    数据结构:
+    data_dir/
+    ├── train/
+    │   ├── digit_0/phase_*.npy
+    │   ├── digit_1/phase_*.npy
+    │   └── ...
+    └── test/
+        └── ...
+    """
+    phase_data = []
+    labels_data = []
+    
+    for split in ['train', 'test']:
+        split_dir = os.path.join(data_dir, split)
+        if not os.path.exists(split_dir):
+            continue
         
-        if magic == 2049:  # Labels
-            num_items = int.from_bytes(f.read(4), byteorder='big')
-            data = np.frombuffer(f.read(num_items), dtype=np.uint8)
-        elif magic == 2051:  # Images
-            num_images = int.from_bytes(f.read(4), byteorder='big')
-            rows = int.from_bytes(f.read(4), byteorder='big')
-            cols = int.from_bytes(f.read(4), byteorder='big')
-            data = np.frombuffer(f.read(num_images * rows * cols), dtype=np.uint8)
-            data = data.reshape(num_images, rows, cols)
+        # 按数字类别加载
+        for digit in range(10):
+            digit_dir = os.path.join(split_dir, f'digit_{digit}')
+            if not os.path.exists(digit_dir):
+                continue
+            
+            phase_files = sorted([f for f in os.listdir(digit_dir) if f.endswith('.npy')])
+            for phase_file in phase_files:
+                phase_path = os.path.join(digit_dir, phase_file)
+                phase = np.load(phase_path)  # shape: (256, 256), dtype: float64, range: [-π, π]
+                phase_data.append(phase)
+                labels_data.append(digit)
+    
+    if not phase_data:
+        raise FileNotFoundError(f"No phase data found in {data_dir}")
+    
+    # 转换为数组
+    phase_array = np.array(phase_data, dtype=np.float32)  # shape: (N, 256, 256)
+    labels_array = np.array(labels_data, dtype=np.int64)   # shape: (N,)
+    
+    # 分离 train/test
+    train_indices = []
+    test_indices = []
+    idx = 0
+    
+    for split in ['train', 'test']:
+        split_dir = os.path.join(data_dir, split)
+        if not os.path.exists(split_dir):
+            continue
+        
+        # 统计这个split的总数
+        split_count = 0
+        for digit in range(10):
+            digit_dir = os.path.join(split_dir, f'digit_{digit}')
+            if os.path.exists(digit_dir):
+                split_count += len([f for f in os.listdir(digit_dir) if f.endswith('.npy')])
+        
+        if split == 'train':
+            train_indices = list(range(idx, idx + split_count))
         else:
-            raise ValueError(f"Unknown magic number: {magic}")
+            test_indices = list(range(idx, idx + split_count))
+        idx += split_count
     
-    return data
-
-
-def load_mnist_data(data_dir='data/minst'):
-    """Load MNIST dataset."""
-    train_images = load_mnist_idx(os.path.join(data_dir, 'train-images.idx3-ubyte'))
-    train_labels = load_mnist_idx(os.path.join(data_dir, 'train-labels.idx1-ubyte'))
-    test_images = load_mnist_idx(os.path.join(data_dir, 't10k-images.idx3-ubyte'))
-    test_labels = load_mnist_idx(os.path.join(data_dir, 't10k-labels.idx1-ubyte'))
+    train_phase = phase_array[train_indices] if train_indices else phase_array
+    train_labels = labels_array[train_indices] if train_indices else labels_array
+    test_phase = phase_array[test_indices] if test_indices else None
+    test_labels = labels_array[test_indices] if test_indices else None
     
-    return train_images, train_labels, test_images, test_labels
+    return train_phase, train_labels, test_phase, test_labels
 
 
-def normalize_images(images):
-    """Normalize images to [-1, 1] range."""
-    # Convert to float and scale to [0, 1]
-    images = images.astype(np.float32) / 255.0
-    # Scale to [-1, 1]
-    images = 2.0 * images - 1.0
-    # Add channel dimension
-    images = np.expand_dims(images, axis=1)
-    return images
+def normalize_phase_data(phase_data):
+    """
+    Normalize phase data to [-1, 1] range.
+    
+    输入: phase_data, shape: (..., 256, 256), range: [-π, π]
+    输出: normalized, shape: (..., 1, 256, 256), range: [-1, 1]
+    """
+    # 相位范围: [-π, π] → [-1, 1]
+    phase_norm = phase_data / np.pi
+    # 添加通道维度 (1, 256, 256)
+    phase_norm = np.expand_dims(phase_norm, axis=1)
+    return phase_norm.astype(np.float32)
 
 
 class Trainer:
@@ -286,13 +330,16 @@ def main():
     print("\n📊 Initializing W&B...")
     wandb.init(
         project='minst',
-        name='conditional_dit_mnist',
+        name='conditional_dit_phase_hologram',  # 更新为相位全息图
         config={
             'num_epochs': 100,
             'batch_size': 128,
             'learning_rate': 1e-4,
             'timesteps': 1000,
             'model_type': 'ConditionalDiT',
+            'data_type': 'phase_hologram',  # 新增
+            'img_size': 256,                # 更新
+            'patch_size': 64,               # 更新
             'hidden_dim': 192,
             'num_layers': 6,
             'num_heads': 3,
@@ -307,29 +354,33 @@ def main():
     timesteps = 1000
     sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
     
-    # Load MNIST
-    print("Loading MNIST dataset...")
-    train_images, train_labels, test_images, test_labels = load_mnist_data()
+    # Load phase hologram data
+    print("Loading phase hologram data...")
+    train_phase, train_labels, test_phase, test_labels = load_phase_data()
     
-    # Normalize
-    train_images = normalize_images(train_images)
-    test_images = normalize_images(test_images)
+    # Normalize phase to [-1, 1]
+    train_phase = normalize_phase_data(train_phase)
+    if test_phase is not None:
+        test_phase = normalize_phase_data(test_phase)
     
-    print(f"Train images shape: {train_images.shape}, dtype: {train_images.dtype}")
+    print(f"Train phase shape: {train_phase.shape}, dtype: {train_phase.dtype}")
+    print(f"  Range: [{train_phase.min():.4f}, {train_phase.max():.4f}]")
     print(f"Train labels shape: {train_labels.shape}, dtype: {train_labels.dtype}")
     
     # Create dataset
     train_dataset = TensorDataset(
-        torch.from_numpy(train_images).float(),
+        torch.from_numpy(train_phase).float(),
         torch.from_numpy(train_labels).long()
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
     # Create model and diffusion
     print("Creating model...")
+    # 注意: 相位数据是256×256, 而不是28×28
+    # 使用64×64 patch (4x4 patches = 16个token)
     model = ConditionalDiT(
-        img_size=28,
-        patch_size=4,
+        img_size=256,           # 改为256 (相位数据分辨率)
+        patch_size=64,          # 改为64 (256/64 = 4, 共16个token)
         in_channels=1,
         hidden_dim=192,
         num_heads=3,
