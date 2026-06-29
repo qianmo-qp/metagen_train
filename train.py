@@ -29,19 +29,16 @@ logging.basicConfig(level=logging.INFO)
 
 def load_phase_data(data_dir='data/minst_phase', use_cache=True):
     """
-    Load phase hologram data from cached .npz files or build cache if not exists.
+    Load phase hologram data from NPZ files.
     
-    缓存结构:
-    data_dir/
-    ├── train/
-    │   ├── digit_0/phase_*.npy
-    │   ├── digit_1/phase_*.npy
-    │   └── ...
-    │   └── phase_train_cache.npz  ← 缓存文件
-    └── test/
-        └── ...
+    支持两种文件格式：
+    1. 直接 NPZ 文件：
+       - minst_phase_train.npz (包含 phase 和 labels)
+       - minst_phase_test.npz (包含 phase 和 labels)
     
-    首次运行时会自动调用 PhaseCacheBuilder 生成缓存
+    2. 分块 NPZ 文件：
+       - train/phase_train_01.npz, phase_train_02.npz, ...
+       - test/phase_test_01.npz
     """
     # Handle both relative and absolute paths
     if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
@@ -51,49 +48,29 @@ def load_phase_data(data_dir='data/minst_phase', use_cache=True):
             data_dir = server_path
             print(f"[INFO] Using server path: {data_dir}")
     
-    # 导入缓存构建器
-    from ds.phase_cache_builder import PhaseCacheBuilder
-    
     train_phase = None
     train_labels = None
     test_phase = None
     test_labels = None
     
-    # 尝试加载缓存
-    for split in ['train', 'test']:
-        split_dir = os.path.join(data_dir, split)
-        cache_path = os.path.join(split_dir, f'phase_{split}_cache.npz')
-        
-        if use_cache and os.path.exists(cache_path):
-            print(f"[INFO] Loading {split} from cache: {cache_path}")
-            try:
-                cache = np.load(cache_path)
-                phase = cache['phase'].astype(np.float32)
-                labels = cache['labels'].astype(np.int64)
-                print(f"✓ {split.upper()} data loaded from cache: {phase.shape}")
-                
-                if split == 'train':
-                    train_phase = phase
-                    train_labels = labels
-                else:
-                    test_phase = phase
-                    test_labels = labels
-            except Exception as e:
-                print(f"⚠ Failed to load cache: {e}, will rebuild...")
-                use_cache = False
-        
-        if not use_cache or not os.path.exists(cache_path):
-            # 构建缓存
-            if split == 'train' or split == 'test':  # 确保目录存在
-                if os.path.exists(split_dir):
-                    print(f"[INFO] Building cache for {split}...")
-                    builder = PhaseCacheBuilder(data_dir, verbose=True)
-                    cache_path, success = builder.build_cache(split, force_rebuild=True)
-                    
-                    if success and os.path.exists(cache_path):
-                        cache = np.load(cache_path)
-                        phase = cache['phase'].astype(np.float32)
-                        labels = cache['labels'].astype(np.int64)
+    # 尝试加载直接 NPZ 文件（推荐格式）
+    direct_npz_files = {
+        'train': os.path.join(data_dir, 'minst_phase_train.npz'),
+        'test': os.path.join(data_dir, 'minst_phase_test.npz')
+    }
+    
+    try:
+        # 尝试加载直接 NPZ 文件
+        for split, npz_path in direct_npz_files.items():
+            if os.path.exists(npz_path):
+                if use_cache:
+                    print(f"[INFO] Loading {split} from NPZ: {npz_path}")
+                    try:
+                        data = np.load(npz_path, allow_pickle=False)
+                        phase = data['phase'].astype(np.float32)
+                        labels = data['labels'].astype(np.int64)
+                        print(f"✓ {split.upper()} data loaded: {phase.shape}")
+                        print(f"  dtype: {phase.dtype}, labels dtype: {labels.dtype}")
                         
                         if split == 'train':
                             train_phase = phase
@@ -101,11 +78,75 @@ def load_phase_data(data_dir='data/minst_phase', use_cache=True):
                         else:
                             test_phase = phase
                             test_labels = labels
+                    except Exception as e:
+                        print(f"⚠ Failed to load {split} NPZ: {e}")
+    except Exception as e:
+        print(f"⚠ Error checking NPZ files: {e}")
+    
+    # 如果直接 NPZ 不存在，尝试加载分块 NPZ 文件
+    if train_phase is None:
+        print(f"\n[INFO] Direct NPZ files not found, trying chunked format...")
+        train_phase, train_labels = _load_chunked_npz(data_dir, 'train')
+        test_phase, test_labels = _load_chunked_npz(data_dir, 'test')
     
     if train_phase is None:
-        raise FileNotFoundError(f"❌ Failed to load or build phase data from {data_dir}")
+        raise FileNotFoundError(f"❌ Failed to load phase data from {data_dir}\n" 
+                              f"   Expected: minst_phase_train.npz, minst_phase_test.npz")
     
     return train_phase, train_labels, test_phase, test_labels
+
+
+def _load_chunked_npz(data_dir, split):
+    """
+    加载分块的 NPZ 文件（如果使用了优化版本的处理器）
+    
+    参数:
+        data_dir: 数据目录
+        split: 'train' 或 'test'
+    
+    返回:
+        phase_data: (N, 256, 256) float32 数组
+        labels_data: (N,) int64 数组
+    """
+    split_dir = os.path.join(data_dir, split)
+    
+    if not os.path.exists(split_dir):
+        return None, None
+    
+    # 查找所有分块 NPZ 文件
+    npz_files = sorted([f for f in os.listdir(split_dir) 
+                       if f.startswith(f'phase_{split}_') and f.endswith('.npz')])
+    
+    if not npz_files:
+        return None, None
+    
+    print(f"[INFO] Found {len(npz_files)} chunked NPZ files for {split}")
+    
+    # 加载并合并所有分块
+    all_phases = []
+    all_labels = []
+    
+    for npz_file in npz_files:
+        npz_path = os.path.join(split_dir, npz_file)
+        try:
+            data = np.load(npz_path, allow_pickle=False)
+            phase = data['phase'].astype(np.float32)
+            labels = data['labels'].astype(np.int64)
+            all_phases.append(phase)
+            all_labels.append(labels)
+            print(f"  ✓ {npz_file}: {phase.shape}")
+        except Exception as e:
+            print(f"  ❌ Failed to load {npz_file}: {e}")
+            return None, None
+    
+    # 合并所有分块
+    if all_phases:
+        phase_data = np.concatenate(all_phases, axis=0)
+        labels_data = np.concatenate(all_labels, axis=0)
+        print(f"✓ {split.upper()} data merged: {phase_data.shape}")
+        return phase_data, labels_data
+    
+    return None, None
 
 
 def normalize_phase_data(phase_data):
