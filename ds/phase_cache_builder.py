@@ -108,7 +108,7 @@ class PhaseCacheBuilder:
         num_samples = len(all_files)
         
         # 预分配数组
-        phase_data = np.zeros((num_samples, 256, 256), dtype=np.float32)
+        phase_data = np.zeros((num_samples, 256, 256), dtype=np.float16)  # float16 节省 50% 空间
         labels_data = np.zeros(num_samples, dtype=np.int64)
         
         if self.verbose:
@@ -119,13 +119,13 @@ class PhaseCacheBuilder:
                 tqdm(all_files, desc=f"加载{split}数据", unit="file", disable=not self.verbose)
             ):
                 phase = np.load(phase_path, allow_pickle=False)
-                phase_data[idx] = phase.astype(np.float32)
+                phase_data[idx] = phase.astype(np.float16)  # 转换为 float16
                 labels_data[idx] = digit
             
             if self.verbose:
                 print(f"✓ 数据加载完成")
                 print(f"  样本数: {num_samples}")
-                print(f"  Phase 数组形状: {phase_data.shape}")
+                print(f"  Phase 数组形状: {phase_data.shape}, dtype: {phase_data.dtype}")
                 print(f"  Label 数组形状: {labels_data.shape}")
                 
                 if not skip_stats:
@@ -213,7 +213,7 @@ class PhaseCacheBuilder:
             # 检查形状和类型
             assert phase.ndim == 3, f"Phase 维度错误: {phase.ndim}, 期望: 3"
             assert phase.shape[1:] == (256, 256), f"Phase 分辨率错误: {phase.shape[1:]}"
-            assert phase.dtype == np.float32, f"Phase dtype 错误: {phase.dtype}"
+            assert phase.dtype == np.float16, f"Phase dtype 错误: {phase.dtype}, 期望: float16"
             
             assert labels.ndim == 1, f"Labels 维度错误: {labels.ndim}"
             assert len(labels) == len(phase), f"样本数不匹配"
