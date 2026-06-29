@@ -40,6 +40,14 @@ def load_phase_data(data_dir='data/minst_phase'):
     └── test/
         └── ...
     """
+    # Handle both relative and absolute paths
+    if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
+        # Try server path if relative path doesn't exist
+        server_path = f'/mnt/model_data/qp/metagen_train/{data_dir}'
+        if os.path.exists(server_path):
+            data_dir = server_path
+            print(f"[INFO] Using server path: {data_dir}")
+    
     phase_data = []
     labels_data = []
     
@@ -62,7 +70,7 @@ def load_phase_data(data_dir='data/minst_phase'):
                 labels_data.append(digit)
     
     if not phase_data:
-        raise FileNotFoundError(f"No phase data found in {data_dir}")
+        raise FileNotFoundError(f"❌ No phase data found in {data_dir}\n   Please check: does {data_dir} exist and contain digit_0-9 subdirectories?")
     
     # 转换为数组
     phase_array = np.array(phase_data, dtype=np.float32)  # shape: (N, 256, 256)
@@ -356,7 +364,8 @@ def main():
     
     # Load phase hologram data
     print("Loading phase hologram data...")
-    train_phase, train_labels, test_phase, test_labels = load_phase_data()
+    train_phase, train_labels, test_phase, test_labels = load_phase_data('data/minst_phase')
+    print(f"✅ Phase data loaded successfully!")
     
     # Normalize phase to [-1, 1]
     train_phase = normalize_phase_data(train_phase)
