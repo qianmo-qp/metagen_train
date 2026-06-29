@@ -27,18 +27,21 @@ from diffusion import create_diffusion
 logging.basicConfig(level=logging.INFO)
 
 
-def load_phase_data(data_dir='data/minst_phase', use_cache=True):
+def load_phase_data(data_dir='data/minst_phase'):
     """
-    Load phase hologram data from NPZ files.
+    Load phase hologram data from chunked NPZ files.
     
-    支持两种文件格式：
-    1. 直接 NPZ 文件：
-       - minst_phase_train.npz (包含 phase 和 labels)
-       - minst_phase_test.npz (包含 phase 和 labels)
-    
-    2. 分块 NPZ 文件：
-       - train/minst_phase_train_01.npz, minst_phase_train_02.npz, ...
-       - test/minst_phase_test_01.npz
+    文件结构:
+    data_dir/
+    ├── train/
+    │   ├── minst_phase_train_01.npz (样本 0-9,999)
+    │   ├── minst_phase_train_02.npz (样本 10,000-19,999)
+    │   ├── minst_phase_train_03.npz (样本 20,000-29,999)
+    │   ├── minst_phase_train_04.npz (样本 30,000-39,999)
+    │   ├── minst_phase_train_05.npz (样本 40,000-49,999)
+    │   └── minst_phase_train_06.npz (样本 50,000-59,999)
+    └── test/
+        └── minst_phase_test_01.npz (样本 0-9,999)
     """
     # Handle both relative and absolute paths
     if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
@@ -48,50 +51,12 @@ def load_phase_data(data_dir='data/minst_phase', use_cache=True):
             data_dir = server_path
             print(f"[INFO] Using server path: {data_dir}")
     
-    train_phase = None
-    train_labels = None
-    test_phase = None
-    test_labels = None
-    
-    # 尝试加载直接 NPZ 文件（推荐格式）
-    direct_npz_files = {
-        'train': os.path.join(data_dir, 'minst_phase_train.npz'),
-        'test': os.path.join(data_dir, 'minst_phase_test.npz')
-    }
-    
-    try:
-        # 尝试加载直接 NPZ 文件
-        for split, npz_path in direct_npz_files.items():
-            if os.path.exists(npz_path):
-                if use_cache:
-                    print(f"[INFO] Loading {split} from NPZ: {npz_path}")
-                    try:
-                        data = np.load(npz_path, allow_pickle=False)
-                        phase = data['phase'].astype(np.float32)
-                        labels = data['labels'].astype(np.int64)
-                        print(f"✓ {split.upper()} data loaded: {phase.shape}")
-                        print(f"  dtype: {phase.dtype}, labels dtype: {labels.dtype}")
-                        
-                        if split == 'train':
-                            train_phase = phase
-                            train_labels = labels
-                        else:
-                            test_phase = phase
-                            test_labels = labels
-                    except Exception as e:
-                        print(f"⚠ Failed to load {split} NPZ: {e}")
-    except Exception as e:
-        print(f"⚠ Error checking NPZ files: {e}")
-    
-    # 如果直接 NPZ 不存在，尝试加载分块 NPZ 文件
-    if train_phase is None:
-        print(f"\n[INFO] Direct NPZ files not found, trying chunked format...")
-        train_phase, train_labels = _load_chunked_npz(data_dir, 'train')
-        test_phase, test_labels = _load_chunked_npz(data_dir, 'test')
+    # 加载分块 NPZ 文件
+    train_phase, train_labels = _load_chunked_npz(data_dir, 'train')
+    test_phase, test_labels = _load_chunked_npz(data_dir, 'test')
     
     if train_phase is None:
-        raise FileNotFoundError(f"❌ Failed to load phase data from {data_dir}\n" 
-                              f"   Expected: minst_phase_train.npz, minst_phase_test.npz")
+        raise FileNotFoundError(f"❌ Failed to load train phase data from {data_dir}")
     
     return train_phase, train_labels, test_phase, test_labels
 
