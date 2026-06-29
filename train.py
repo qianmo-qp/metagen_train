@@ -76,6 +76,7 @@ def _load_chunked_npz(data_dir, split):
     split_dir = os.path.join(data_dir, split)
     
     if not os.path.exists(split_dir):
+        print(f"❌ Directory not found: {split_dir}")
         return None, None
     
     # 查找所有分块 NPZ 文件
@@ -83,32 +84,59 @@ def _load_chunked_npz(data_dir, split):
                        if f.startswith(f'minst_phase_{split}_') and f.endswith('.npz')])
     
     if not npz_files:
+        print(f"❌ No NPZ files found in: {split_dir}")
         return None, None
     
-    print(f"[INFO] Found {len(npz_files)} chunked NPZ files for {split}")
+    print(f"\n[INFO] Found {len(npz_files)} chunked NPZ files for {split}")
     
     # 加载并合并所有分块
     all_phases = []
     all_labels = []
+    total_size_mb = 0
+    total_samples = 0
     
-    for npz_file in npz_files:
+    for idx, npz_file in enumerate(npz_files, 1):
         npz_path = os.path.join(split_dir, npz_file)
+        file_size_mb = os.path.getsize(npz_path) / (1024 ** 2)
+        total_size_mb += file_size_mb
+        
         try:
+            print(f"  [{idx}/{len(npz_files)}] Loading {npz_file} ({file_size_mb:.1f} MB)...", end='', flush=True)
+            
             data = np.load(npz_path, allow_pickle=False)
             phase = data['phase'].astype(np.float32)
             labels = data['labels'].astype(np.int64)
+            
+            samples = phase.shape[0]
+            total_samples += samples
+            
             all_phases.append(phase)
             all_labels.append(labels)
-            print(f"  ✓ {npz_file}: {phase.shape}")
+            
+            # 显示详细信息
+            phase_min, phase_max, phase_mean = phase.min(), phase.max(), phase.mean()
+            print(f" ✓ {phase.shape} (labels: {labels.min()}-{labels.max()}, "
+                  f"phase: [{phase_min:.3f}, {phase_max:.3f}], mean: {phase_mean:.3f})")
         except Exception as e:
-            print(f"  ❌ Failed to load {npz_file}: {e}")
+            print(f" ❌ Error: {e}")
             return None, None
     
     # 合并所有分块
     if all_phases:
+        print(f"\n[INFO] Merging {len(all_phases)} chunks ({total_size_mb:.1f} MB total)...", end='', flush=True)
         phase_data = np.concatenate(all_phases, axis=0)
         labels_data = np.concatenate(all_labels, axis=0)
-        print(f"✓ {split.upper()} data merged: {phase_data.shape}")
+        print(f" ✓ Done")
+        
+        # 显示最终统计
+        print(f"✓ {split.upper()} data loaded:")
+        print(f"  Shape: {phase_data.shape}")
+        print(f"  Dtype: {phase_data.dtype}")
+        print(f"  Labels dtype: {labels_data.dtype}")
+        print(f"  Labels range: {labels_data.min()}-{labels_data.max()}")
+        print(f"  Phase range: [{phase_data.min():.3f}, {phase_data.max():.3f}]")
+        print(f"  Phase mean: {phase_data.mean():.3f}")
+        
         return phase_data, labels_data
     
     return None, None
