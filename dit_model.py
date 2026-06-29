@@ -203,8 +203,8 @@ class ConditionalDiT(nn.Module):
     
     def __init__(
         self,
-        img_size=28,
-        patch_size=4,
+        img_size=256,
+        patch_size=16,
         in_channels=1,
         hidden_dim=192,
         num_heads=3,
@@ -215,7 +215,10 @@ class ConditionalDiT(nn.Module):
     ):
         super().__init__()
         
+        self.img_size = img_size
+        self.patch_size = patch_size
         self.hidden_dim = hidden_dim
+        self.in_channels = in_channels
         self.num_patches = (img_size // patch_size) ** 2
         
         # Patch embedding
@@ -245,8 +248,7 @@ class ConditionalDiT(nn.Module):
         # Final layer norm
         self.final_norm = nn.LayerNorm(hidden_dim)
         
-        # Un-patchify
-        self.unpatchify = Unpatchify(img_size, patch_size, in_channels, hidden_dim)
+        self.unpatchify = Unpatchify(self.img_size, self.patch_size, in_channels, hidden_dim)
         
         # Output head: predict noise
         self.out_head = nn.Linear(hidden_dim, in_channels * patch_size * patch_size)
@@ -280,27 +282,25 @@ class ConditionalDiT(nn.Module):
         x = self.final_norm(x)
         
         # Predict noise per patch
-        patch_size = 4
         noise_per_patch = self.out_head(x)  # (B, num_patches, in_channels * patch_size * patch_size)
         
         # Reshape back via unpatchify-like operation
         B, num_patches, patch_out_dim = noise_per_patch.shape
         num_patches_h = num_patches_w = int(math.sqrt(num_patches))
-        in_channels = 1
         
         noise_per_patch = noise_per_patch.reshape(
-            B, num_patches_h, num_patches_w, in_channels, patch_size, patch_size
+            B, num_patches_h, num_patches_w, self.in_channels, self.patch_size, self.patch_size
         )
         noise_pred = noise_per_patch.permute(0, 3, 1, 4, 2, 5).contiguous()
-        noise_pred = noise_pred.reshape(B, in_channels, 28, 28)
+        noise_pred = noise_pred.reshape(B, self.in_channels, self.img_size, self.img_size)
         
         return noise_pred
 
 
 if __name__ == "__main__":
     # Quick test
-    model = ConditionalDiT()
-    x = torch.randn(2, 1, 28, 28)
+    model = ConditionalDiT(img_size=256, patch_size=16)
+    x = torch.randn(2, 1, 256, 256)
     t = torch.randint(0, 1000, (2,))
     c = torch.randint(0, 10, (2,))
     
