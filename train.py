@@ -27,18 +27,21 @@ from diffusion import create_diffusion
 logging.basicConfig(level=logging.INFO)
 
 
-def load_phase_data(data_dir='data/minst_phase'):
+def load_phase_data(data_dir='data/minst_phase', use_cache=True):
     """
-    Load phase hologram data from .npy files.
+    Load phase hologram data from cached .npz files or build cache if not exists.
     
-    数据结构:
+    缓存结构:
     data_dir/
     ├── train/
     │   ├── digit_0/phase_*.npy
     │   ├── digit_1/phase_*.npy
     │   └── ...
+    │   └── phase_train_cache.npz  ← 缓存文件
     └── test/
         └── ...
+    
+    首次运行时会自动调用 PhaseCacheBuilder 生成缓存
     """
     # Handle both relative and absolute paths
     if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
@@ -48,61 +51,59 @@ def load_phase_data(data_dir='data/minst_phase'):
             data_dir = server_path
             print(f"[INFO] Using server path: {data_dir}")
     
-    phase_data = []
-    labels_data = []
+    # 导入缓存构建器
+    from ds.phase_cache_builder import PhaseCacheBuilder
     
+    train_phase = None
+    train_labels = None
+    test_phase = None
+    test_labels = None
+    
+    # 尝试加载缓存
     for split in ['train', 'test']:
         split_dir = os.path.join(data_dir, split)
-        if not os.path.exists(split_dir):
-            continue
+        cache_path = os.path.join(split_dir, f'phase_{split}_cache.npz')
         
-        # 按数字类别加载
-        for digit in range(10):
-            digit_dir = os.path.join(split_dir, f'digit_{digit}')
-            if not os.path.exists(digit_dir):
-                continue
-            
-            phase_files = sorted([f for f in os.listdir(digit_dir) if f.endswith('.npy')])
-            for phase_file in phase_files:
-                phase_path = os.path.join(digit_dir, phase_file)
-                phase = np.load(phase_path)  # shape: (256, 256), dtype: float64, range: [-π, π]
-                phase_data.append(phase)
-                labels_data.append(digit)
-    
-    if not phase_data:
-        raise FileNotFoundError(f"❌ No phase data found in {data_dir}\n   Please check: does {data_dir} exist and contain digit_0-9 subdirectories?")
-    
-    # 转换为数组
-    phase_array = np.array(phase_data, dtype=np.float32)  # shape: (N, 256, 256)
-    labels_array = np.array(labels_data, dtype=np.int64)   # shape: (N,)
-    
-    # 分离 train/test
-    train_indices = []
-    test_indices = []
-    idx = 0
-    
-    for split in ['train', 'test']:
-        split_dir = os.path.join(data_dir, split)
-        if not os.path.exists(split_dir):
-            continue
+        if use_cache and os.path.exists(cache_path):
+            print(f"[INFO] Loading {split} from cache: {cache_path}")
+            try:
+                cache = np.load(cache_path)
+                phase = cache['phase'].astype(np.float32)
+                labels = cache['labels'].astype(np.int64)
+                print(f"✓ {split.upper()} data loaded from cache: {phase.shape}")
+                
+                if split == 'train':
+                    train_phase = phase
+                    train_labels = labels
+                else:
+                    test_phase = phase
+                    test_labels = labels
+            except Exception as e:
+                print(f"⚠ Failed to load cache: {e}, will rebuild...")
+                use_cache = False
         
-        # 统计这个split的总数
-        split_count = 0
-        for digit in range(10):
-            digit_dir = os.path.join(split_dir, f'digit_{digit}')
-            if os.path.exists(digit_dir):
-                split_count += len([f for f in os.listdir(digit_dir) if f.endswith('.npy')])
-        
-        if split == 'train':
-            train_indices = list(range(idx, idx + split_count))
-        else:
-            test_indices = list(range(idx, idx + split_count))
-        idx += split_count
+        if not use_cache or not os.path.exists(cache_path):
+            # 构建缓存
+            if split == 'train' or split == 'test':  # 确保目录存在
+                if os.path.exists(split_dir):
+                    print(f"[INFO] Building cache for {split}...")
+                    builder = PhaseCacheBuilder(data_dir, verbose=True)
+                    cache_path, success = builder.build_cache(split, force_rebuild=True)
+                    
+                    if success and os.path.exists(cache_path):
+                        cache = np.load(cache_path)
+                        phase = cache['phase'].astype(np.float32)
+                        labels = cache['labels'].astype(np.int64)
+                        
+                        if split == 'train':
+                            train_phase = phase
+                            train_labels = labels
+                        else:
+                            test_phase = phase
+                            test_labels = labels
     
-    train_phase = phase_array[train_indices] if train_indices else phase_array
-    train_labels = labels_array[train_indices] if train_indices else labels_array
-    test_phase = phase_array[test_indices] if test_indices else None
-    test_labels = labels_array[test_indices] if test_indices else None
+    if train_phase is None:
+        raise FileNotFoundError(f"❌ Failed to load or build phase data from {data_dir}")
     
     return train_phase, train_labels, test_phase, test_labels
 
