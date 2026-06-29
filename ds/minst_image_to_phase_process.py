@@ -1,12 +1,13 @@
 """
-MNIST Image to Phase Hologram Processing Pipeline
-MNIST 图像 → 相位全息图转换 → NPZ 缓存生成（一体化处理）
+MNIST Image to Phase Hologram Processing Pipeline (Optimized)
+MNIST 图像 → 相位全息图 NPZ 文件（直接生成，无中间文件）
 
-整合功能：
-1. MNIST IDX 格式读取
-2. 图像 → 相位全息图转换 (Gerchberg-Saxton)
-3. 相位数据存储为单个 .npy 文件
-4. 自动生成 NPZ 缓存（float16 压缩存储）
+优化特性：
+1. 无中间 .npy 文件 - 直接生成 NPZ
+2. 按 10,000 个数据一个文件分割
+3. float32 精度（无损存储）
+4. 多线程处理（8 个线程）
+5. 自动编号（train: 01-06, test: 01）
 """
 
 import numpy as np
@@ -15,38 +16,43 @@ import sys
 from pathlib import Path
 from tqdm import tqdm
 import argparse
-import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # 导入相位提取器
 from phase_extractor import PhaseExtractor
 
 
-class MNISTPhaseConverter:
-    """MNIST 图像到相位全息图的完整转换管道"""
+class OptimizedPhaseConverter:
+    """优化版本的相位转换处理器"""
     
-    def __init__(self, mnist_data_dir, output_dir, resolution=256, iterations=200, verbose=True):
+    def __init__(self, mnist_data_dir, output_dir, resolution=256, iterations=200, 
+                 num_workers=8, chunk_size=10000, verbose=True):
         """
         参数:
-            mnist_data_dir: MNIST 数据集目录 (包含 train-images.idx3-ubyte 等)
+            mnist_data_dir: MNIST 数据集目录
             output_dir: 输出目录
-            resolution: 相位处理分辨率 (默认: 256)
-            iterations: Gerchberg-Saxton 迭代次数 (默认: 200)
+            resolution: 相位处理分辨率
+            iterations: GS 迭代次数
+            num_workers: 多线程数量
+            chunk_size: 每个 NPZ 文件包含的样本数
             verbose: 是否打印详细信息
         """
         self.mnist_data_dir = mnist_data_dir
         self.output_dir = output_dir
         self.resolution = resolution
         self.iterations = iterations
+        self.num_workers = num_workers
+        self.chunk_size = chunk_size
         self.verbose = verbose
         self.extractor = PhaseExtractor(resolution, iterations, verbose=False)
+        self.lock = threading.Lock()
     
     # ======================== IDX 格式读取 ========================
     
     def read_idx_images(self, filename):
         """
         读取 MNIST IDX 格式图像文件
-        
-        IDX 格式: magic_number (4B) | num_images (4B) | height (4B) | width (4B) | data
         
         参数:
             filename: IDX 文件路径
@@ -72,8 +78,6 @@ class MNISTPhaseConverter:
         """
         读取 MNIST IDX 格式标签文件
         
-        IDX 格式: magic_number (4B) | num_items (4B) | data
-        
         参数:
             filename: IDX 文件路径
         
@@ -92,12 +96,6 @@ class MNISTPhaseConverter:
     def image_to_phase(self, image_28x28):
         """
         将单个 MNIST 图像转换为相位全息图
-        
-        流程:
-        1. 归一化到 [0, 1]
-        2. 上采样到 256×256
-        3. 对比度增强
-        4. Gerchberg-Saxton 算法提取相位
         
         参数:
             image_28x28: (28, 28) 灰度图像，像素值 [0, 255]
@@ -124,16 +122,36 @@ class MNISTPhaseConverter:
         
         return phase
     
-    # ======================== 数据集处理 ========================
+    # ======================== 多线程批处理 ========================
     
-    def process_dataset(self, split='train'):
+    def process_batch(self, images, labels, start_idx, end_idx):
         """
-        处理单个数据集 (train 或 test)
+        多线程处理一个批次的图像
         
-        步骤:
-        1. 加载 MNIST IDX 文件
-        2. 逐个转换为相位
-        3. 按数字类别保存为 .npy 文件
+        参数:
+            images: MNIST 图像数组
+            labels: MNIST 标签数组
+            start_idx: 起始索引
+            end_idx: 结束索引
+        
+        返回:
+            phase_data: 相位数据 (float32)
+            labels_data: 标签数据
+        """
+        batch_size = end_idx - start_idx
+        phase_data = np.zeros((batch_size, self.resolution, self.resolution), dtype=np.float32)
+        labels_data = np.zeros(batch_size, dtype=np.int64)
+        
+        for idx in range(batch_size):
+            image_idx = start_idx + idx
+            phase_data[idx] = self.image_to_phase(images[image_idx]).astype(np.float32)
+            labels_data[idx] = labels[image_idx]
+        
+        return phase_data, labels_data
+    
+    def process_dataset_parallel(self, split='train'):
+        """
+        使用多线程并行处理数据集，直接生成 NPZ 文件
         
         参数:
             split: 'train' 或 'test'
@@ -174,206 +192,152 @@ class MNISTPhaseConverter:
         output_split_dir = os.path.join(self.output_dir, split)
         os.makedirs(output_split_dir, exist_ok=True)
         
-        # 创建标签目录 (0-9)
-        for digit in range(10):
-            os.makedirs(os.path.join(output_split_dir, f'digit_{digit}'), exist_ok=True)
+        # 计算需要的 NPZ 文件数量和编号
+        total_samples = len(images)
+        num_chunks = (total_samples + self.chunk_size - 1) // self.chunk_size
         
-        # 处理每个图像
-        processed_count = {i: 0 for i in range(10)}
-        
-        for idx in tqdm(range(len(images)), desc=f"处理{split}数据集", disable=not self.verbose):
-            image = images[idx]
-            label = labels[idx]
-            
-            # 转换为相位
-            phase = self.image_to_phase(image)
-            
-            # 保存相位为 .npy 文件
-            digit_dir = os.path.join(output_split_dir, f'digit_{label}')
-            phase_filename = f'phase_{processed_count[label]:05d}.npy'
-            phase_path = os.path.join(digit_dir, phase_filename)
-            
-            np.save(phase_path, phase)
-            
-            processed_count[label] += 1
-        
-        # 统计信息
         if self.verbose:
-            print(f"\n✓ {split.upper()} 处理完成!")
-            total = sum(processed_count.values())
-            print(f"  总数: {total}")
-            print(f"  各数字分布:")
-            for digit in range(10):
-                print(f"    数字 {digit}: {processed_count[digit]:6d} 个")
+            print(f"  总样本数: {total_samples}")
+            print(f"  分块大小: {self.chunk_size}")
+            print(f"  NPZ 文件数: {num_chunks}")
+            print(f"  使用 {self.num_workers} 个线程处理\n")
+        
+        # 多线程处理每个 chunk
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = {}
+            
+            # 提交所有任务
+            for chunk_id in range(num_chunks):
+                start_idx = chunk_id * self.chunk_size
+                end_idx = min((chunk_id + 1) * self.chunk_size, total_samples)
+                
+                future = executor.submit(
+                    self.process_batch,
+                    images, labels, start_idx, end_idx
+                )
+                futures[future] = (chunk_id, start_idx, end_idx)
+            
+            # 处理完成的任务并保存 NPZ 文件
+            pbar = tqdm(total=num_chunks, desc=f"处理{split}数据集", disable=not self.verbose)
+            
+            for future in as_completed(futures):
+                chunk_id, start_idx, end_idx = futures[future]
+                
+                try:
+                    phase_data, labels_data = future.result()
+                    
+                    # 生成编号（01-06 for train, 01 for test）
+                    chunk_num = chunk_id + 1
+                    chunk_filename = f'phase_{split}_{chunk_num:02d}.npz'
+                    chunk_path = os.path.join(output_split_dir, chunk_filename)
+                    
+                    # 保存 NPZ 文件
+                    np.savez(
+                        chunk_path,
+                        phase=phase_data,
+                        labels=labels_data
+                    )
+                    
+                    pbar.update(1)
+                
+                except Exception as e:
+                    print(f"❌ 处理 chunk {chunk_id} 失败: {e}")
+                    return False
+            
+            pbar.close()
+        
+        if self.verbose:
+            print(f"✓ {split.upper()} 处理完成!")
+            print(f"  生成 {num_chunks} 个 NPZ 文件")
         
         return True
     
-    # ======================== NPZ 缓存生成 ========================
+    # ======================== 验证和统计 ========================
     
-    def build_cache(self, split='train', skip_stats=True):
+    def verify_npz_files(self, split='train'):
         """
-        为指定的 split 构建 NPZ 缓存文件
-        
-        特性:
-        - float16 存储（节省 50% 空间）
-        - 使用 savez_compressed
-        - 验证完整性
+        验证生成的 NPZ 文件
         
         参数:
             split: 'train' 或 'test'
-            skip_stats: 是否跳过统计计算（加快速度）
         
         返回:
-            cache_path: 缓存文件路径
-            success: 是否成功
+            success: 是否验证成功
         """
         split_dir = os.path.join(self.output_dir, split)
-        cache_path = os.path.join(split_dir, f'phase_{split}_cache.npz')
         
-        if self.verbose:
-            print(f"\n[{split.upper()}] 开始构建 NPZ 缓存...")
-        
-        # 检查源目录
         if not os.path.exists(split_dir):
             print(f"❌ 目录不存在: {split_dir}")
-            return None, False
-        
-        # 扫描所有 .npy 文件
-        all_files = []
-        for digit in range(10):
-            digit_dir = os.path.join(split_dir, f'digit_{digit}')
-            if os.path.exists(digit_dir):
-                phase_files = sorted([f for f in os.listdir(digit_dir) 
-                                     if f.endswith('.npy')])
-                for phase_file in phase_files:
-                    all_files.append((digit, os.path.join(digit_dir, phase_file)))
-        
-        if not all_files:
-            print(f"❌ 未找到任何 .npy 文件在: {split_dir}")
-            return None, False
-        
-        # 加载所有数据到内存
-        num_samples = len(all_files)
-        phase_data = np.zeros((num_samples, 256, 256), dtype=np.float16)  # float16 节省空间
-        labels_data = np.zeros(num_samples, dtype=np.int64)
+            return False
         
         if self.verbose:
-            print(f"  加载 {num_samples} 个样本...")
+            print(f"\n[验证] {split} NPZ 文件...")
+        
+        npz_files = sorted([f for f in os.listdir(split_dir) if f.endswith('.npz')])
+        
+        if not npz_files:
+            print(f"❌ 未找到 NPZ 文件在: {split_dir}")
+            return False
+        
+        total_samples = 0
+        all_labels = []
         
         try:
-            for idx, (digit, phase_path) in enumerate(
-                tqdm(all_files, desc=f"加载{split}数据", unit="file", disable=not self.verbose)
-            ):
-                phase = np.load(phase_path, allow_pickle=False)
-                phase_data[idx] = phase.astype(np.float16)  # 转换为 float16
-                labels_data[idx] = digit
-            
-            if self.verbose:
-                print(f"✓ 数据加载完成")
-                print(f"  样本数: {num_samples}")
-                print(f"  Phase 数组形状: {phase_data.shape}, dtype: {phase_data.dtype}")
-                print(f"  Label 数组形状: {labels_data.shape}, dtype: {labels_data.dtype}")
+            for npz_file in npz_files:
+                npz_path = os.path.join(split_dir, npz_file)
                 
-                if not skip_stats:
-                    print(f"  计算统计信息...", end="", flush=True)
-                    phase_min = phase_data.min()
-                    phase_max = phase_data.max()
-                    label_counts = np.bincount(labels_data.astype(int))
-                    print(f" 完成")
-                    print(f"  Phase 范围: [{phase_min:.4f}, {phase_max:.4f}]")
-                    print(f"  Label 分布: {dict(zip(range(10), label_counts))}")
-            
-        except Exception as e:
-            print(f"❌ 加载数据失败: {e}")
-            return None, False
-        
-        # 保存 NPZ 缓存
-        try:
-            if self.verbose:
-                print(f"  保存 NPZ 缓存...", end="", flush=True)
-            
-            np.savez_compressed(cache_path, phase=phase_data, labels=labels_data)
-            
-            cache_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
-            
-            if self.verbose:
-                print(f" 完成")
-                print(f"✓ 缓存保存成功: {cache_path}")
-                print(f"  文件大小: {cache_size_mb:.2f} MB")
-            
-            return cache_path, True
+                # 加载并验证
+                data = np.load(npz_path, allow_pickle=False)
+                phase = data['phase']
+                labels = data['labels']
+                
+                # 检查形状和类型
+                assert phase.ndim == 3, f"Phase 维度错误: {phase.ndim}"
+                assert phase.shape[1:] == (self.resolution, self.resolution), \
+                    f"Phase 分辨率错误: {phase.shape[1:]}"
+                assert phase.dtype == np.float32, f"Phase dtype 错误: {phase.dtype}"
+                
+                assert labels.ndim == 1, f"Labels 维度错误: {labels.ndim}"
+                assert len(labels) == len(phase), f"样本数不匹配"
+                assert labels.dtype == np.int64, f"Labels dtype 错误: {labels.dtype}"
+                
+                total_samples += len(phase)
+                all_labels.extend(labels.tolist())
         
         except Exception as e:
-            print(f"❌ 保存缓存失败: {e}")
-            return None, False
-    
-    def verify_cache(self, split='train'):
-        """
-        验证缓存文件的完整性和正确性
-        
-        参数:
-            split: 'train' 或 'test'
-        
-        返回:
-            success: 是否验证通过
-        """
-        split_dir = os.path.join(self.output_dir, split)
-        cache_path = os.path.join(split_dir, f'phase_{split}_cache.npz')
-        
-        if not os.path.exists(cache_path):
-            print(f"❌ 缓存文件不存在: {cache_path}")
+            print(f"❌ 验证失败: {e}")
             return False
         
-        try:
-            if self.verbose:
-                print(f"\n[验证] {split} 缓存...")
+        if self.verbose:
+            print(f"✓ NPZ 文件验证通过:")
+            print(f"  文件数: {len(npz_files)}")
+            print(f"  总样本数: {total_samples}")
             
-            cache = np.load(cache_path)
-            phase = cache['phase']
-            labels = cache['labels']
+            # 显示标签分布
+            unique, counts = np.unique(all_labels, return_counts=True)
+            print(f"  标签分布:")
+            for label, count in zip(unique, counts):
+                print(f"    数字 {label}: {count:6d} 个")
             
-            # 检查形状和类型
-            assert phase.ndim == 3, f"Phase 维度错误: {phase.ndim}"
-            assert phase.shape[1:] == (256, 256), f"Phase 分辨率错误: {phase.shape[1:]}"
-            assert phase.dtype == np.float16, f"Phase dtype 错误: {phase.dtype}"
-            
-            assert labels.ndim == 1, f"Labels 维度错误: {labels.ndim}"
-            assert len(labels) == len(phase), f"样本数不匹配"
-            assert labels.dtype == np.int64, f"Labels dtype 错误: {labels.dtype}"
-            
-            assert labels.min() >= 0 and labels.max() <= 9, f"Label 超出范围: [{labels.min()}, {labels.max()}]"
-            
-            if self.verbose:
-                print(f"✓ 缓存验证通过:")
-                print(f"  样本数: {len(phase)}")
-                print(f"  Phase 形状: {phase.shape}, dtype: {phase.dtype}")
-                print(f"  Labels 形状: {labels.shape}, dtype: {labels.dtype}")
-                print(f"  Phase 范围: [{phase.min():.4f}, {phase.max():.4f}]")
-                print(f"  Label 分布: {np.bincount(labels)}")
-            
-            return True
+            # 显示文件大小
+            total_size_mb = sum(os.path.getsize(os.path.join(split_dir, f)) 
+                              for f in npz_files) / (1024 * 1024)
+            print(f"  总文件大小: {total_size_mb:.2f} MB")
         
-        except Exception as e:
-            print(f"❌ 缓存验证失败: {e}")
-            return False
+        return True
     
     # ======================== 完整流程 ========================
     
-    def process_all(self, build_cache=True):
+    def process_all(self):
         """
-        完整的处理流程:
-        1. MNIST IDX → 相位 .npy 文件
-        2. 生成 NPZ 缓存 (可选)
-        
-        参数:
-            build_cache: 是否在完成后构建 NPZ 缓存
+        完整的处理流程：MNIST IDX → NPZ 文件（直接，无中间文件）
         
         返回:
             success: 是否全部成功
         """
-        print("=" * 60)
-        print("MNIST 图像 → 相位全息图转换管道")
-        print("=" * 60)
+        print("=" * 70)
+        print("MNIST 图像 → 相位全息图 NPZ 处理管道（优化版）")
+        print("=" * 70)
         
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -381,74 +345,74 @@ class MNISTPhaseConverter:
             print(f"\n配置:")
             print(f"  MNIST 目录: {self.mnist_data_dir}")
             print(f"  输出目录: {self.output_dir}")
-            print(f"  分辨率: {self.resolution}×{self.resolution}")
+            print(f"  相位分辨率: {self.resolution}×{self.resolution}")
             print(f"  GS 迭代次数: {self.iterations}")
-            print(f"  构建缓存: {build_cache}")
+            print(f"  多线程数: {self.num_workers}")
+            print(f"  文件分块大小: {self.chunk_size} 样本/文件")
+            print(f"  数据精度: float32 (无损)")
         
         # 处理训练集和测试集
-        train_ok = self.process_dataset('train')
-        test_ok = self.process_dataset('test')
+        train_ok = self.process_dataset_parallel('train')
+        test_ok = self.process_dataset_parallel('test')
         
         if not (train_ok and test_ok):
             print("\n❌ 数据集处理失败!")
             return False
         
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("✓ 所有数据集处理完成!")
-        print("=" * 60)
+        print("=" * 70)
         
-        # 构建缓存
-        if build_cache:
-            print("\n" + "=" * 60)
-            print("开始构建 NPZ 缓存...")
-            print("=" * 60)
-            
-            results = {}
-            for split in ['train', 'test']:
-                cache_path, success = self.build_cache(split, skip_stats=True)
-                results[split] = (cache_path, success)
-                
-                if success:
-                    self.verify_cache(split)
-            
-            if not all(success for _, success in results.values()):
-                print("\n⚠ 缓存构建失败!")
-                return False
+        # 验证所有文件
+        print("\n" + "=" * 70)
+        print("验证生成的 NPZ 文件...")
+        print("=" * 70)
         
-        print("\n" + "=" * 60)
+        train_verify = self.verify_npz_files('train')
+        test_verify = self.verify_npz_files('test')
+        
+        if not (train_verify and test_verify):
+            print("\n⚠ 验证失败!")
+            return False
+        
+        print("\n" + "=" * 70)
         print("✓ 完整处理流程完成!")
-        print("=" * 60)
-        print(f"\n目录结构:")
+        print("=" * 70)
+        print(f"\n生成的文件结构:")
         print(f"{self.output_dir}/")
         print(f"├── train/")
-        print(f"│   ├── digit_0/ ... digit_9/  (共 60,000 个 .npy 文件)")
-        print(f"│   └── phase_train_cache.npz  (缓存, 如已构建)")
+        print(f"│   ├── phase_train_01.npz  (样本 0-9999)")
+        print(f"│   ├── phase_train_02.npz  (样本 10000-19999)")
+        print(f"│   ├── phase_train_03.npz  (样本 20000-29999)")
+        print(f"│   ├── phase_train_04.npz  (样本 30000-39999)")
+        print(f"│   ├── phase_train_05.npz  (样本 40000-49999)")
+        print(f"│   └── phase_train_06.npz  (样本 50000-59999)")
         print(f"└── test/")
-        print(f"    ├── digit_0/ ... digit_9/  (共 10,000 个 .npy 文件)")
-        print(f"    └── phase_test_cache.npz   (缓存, 如已构建)")
+        print(f"    └── phase_test_01.npz   (样本 0-9999)")
+        print(f"\n每个 NPZ 文件包含:")
+        print(f"  - 'phase': (N, {self.resolution}, {self.resolution}) float32 相位数据")
+        print(f"  - 'labels': (N,) int64 标签 (0-9)")
         
         return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MNIST 图像到相位全息图转换管道',
+        description='MNIST 图像到相位全息图转换 (优化版)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例:
-  # 完整流程: 转换 + 生成缓存
+  # 完整处理（默认参数）
   python3 minst_image_to_phase_process.py
-  
-  # 仅转换，不生成缓存
-  python3 minst_image_to_phase_process.py --no-cache
   
   # 自定义参数
   python3 minst_image_to_phase_process.py \\
     -md ./data/minst \\
     -od ./data/minst_phase \\
-    -r 256 -i 200
+    -r 256 -i 200 \\
+    -w 16 --chunk-size 5000
   
-  # 仅验证现有缓存
+  # 仅验证
   python3 minst_image_to_phase_process.py --verify-only
         ''')
     
@@ -462,29 +426,33 @@ def main():
                        help='相位处理分辨率 (默认: 256)')
     parser.add_argument('--iterations', '-i', type=int, default=200,
                        help='GS 迭代次数 (默认: 200)')
-    parser.add_argument('--no-cache', action='store_true',
-                       help='不生成 NPZ 缓存')
+    parser.add_argument('--workers', '-w', type=int, default=8,
+                       help='多线程数量 (默认: 8)')
+    parser.add_argument('--chunk-size', type=int, default=10000,
+                       help='每个 NPZ 文件的样本数 (默认: 10000)')
     parser.add_argument('--verify-only', action='store_true',
-                       help='仅验证现有缓存，不进行处理')
+                       help='仅验证现有 NPZ 文件')
     parser.add_argument('--quiet', '-q', action='store_true',
                        help='安静模式')
     
     args = parser.parse_args()
     
-    converter = MNISTPhaseConverter(
+    converter = OptimizedPhaseConverter(
         args.mnist_dir,
         args.output_dir,
         args.resolution,
         args.iterations,
+        args.workers,
+        args.chunk_size,
         verbose=not args.quiet
     )
     
     if args.verify_only:
-        # 仅验证缓存
-        success = all(converter.verify_cache(split) for split in ['train', 'test'])
+        # 仅验证
+        success = all(converter.verify_npz_files(split) for split in ['train', 'test'])
     else:
-        # 完整处理流程
-        success = converter.process_all(build_cache=not args.no_cache)
+        # 完整处理
+        success = converter.process_all()
     
     sys.exit(0 if success else 1)
 
