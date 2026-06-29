@@ -23,13 +23,14 @@ class PhaseCacheBuilder:
         self.data_dir = data_dir
         self.verbose = verbose
     
-    def build_cache(self, split='train', force_rebuild=False):
+    def build_cache(self, split='train', force_rebuild=False, skip_stats=False):
         """
         为指定的 split 构建缓存文件
         
         参数:
             split: 'train' 或 'test'
             force_rebuild: 是否强制重建（即使缓存已存在）
+            skip_stats: 是否跳过统计信息计算（加快速度，仅在构建时）
         
         返回:
             cache_path: 缓存文件路径
@@ -60,7 +61,7 @@ class PhaseCacheBuilder:
             return None, False
         
         # 加载数据
-        phase_data, labels_data = self._load_data(all_files, split)
+        phase_data, labels_data = self._load_data(all_files, split, skip_stats=skip_stats)
         
         if phase_data is None:
             return None, False
@@ -92,13 +93,14 @@ class PhaseCacheBuilder:
         
         return all_files
     
-    def _load_data(self, all_files, split):
+    def _load_data(self, all_files, split, skip_stats=False):
         """
         加载所有 .npy 文件到内存
         
         参数:
             all_files: [(digit, file_path), ...] 列表
             split: 'train' 或 'test'
+            skip_stats: 是否跳过统计信息计算
         
         返回:
             (phase_data, labels_data) 元组，或 (None, None) 如果失败
@@ -125,8 +127,19 @@ class PhaseCacheBuilder:
                 print(f"  样本数: {num_samples}")
                 print(f"  Phase 数组形状: {phase_data.shape}")
                 print(f"  Label 数组形状: {labels_data.shape}")
-                print(f"  Phase 范围: [{phase_data.min():.4f}, {phase_data.max():.4f}]")
-                print(f"  Label 分布: {np.bincount(labels_data.astype(int))}")
+                
+                if not skip_stats:
+                    # 计算统计信息（可能需要几秒）
+                    print(f"  计算统计信息...", end="", flush=True)
+                    phase_min = phase_data.min()
+                    phase_max = phase_data.max()
+                    label_counts = np.bincount(labels_data.astype(int))
+                    print(f" 完成")
+                    
+                    print(f"  Phase 范围: [{phase_min:.4f}, {phase_max:.4f}]")
+                    print(f"  Label 分布: {dict(zip(range(10), label_counts))}")
+                else:
+                    print(f"  (跳过统计计算以加快速度)")
             
             return phase_data, labels_data
         
@@ -223,12 +236,13 @@ class PhaseCacheBuilder:
             print(f"❌ 缓存验证失败: {e}")
             return False
     
-    def build_all(self, force_rebuild=False):
+    def build_all(self, force_rebuild=False, skip_stats=True):
         """
         为所有 split 构建缓存
         
         参数:
             force_rebuild: 是否强制重建
+            skip_stats: 是否跳过统计计算 (〜60K样本更快)
         
         返回:
             success: 是否全部成功
@@ -241,7 +255,7 @@ class PhaseCacheBuilder:
         results = {}
         
         for split in ['train', 'test']:
-            cache_path, success = self.build_cache(split, force_rebuild)
+            cache_path, success = self.build_cache(split, force_rebuild, skip_stats=skip_stats)
             results[split] = (cache_path, success)
             
             if success:
@@ -281,6 +295,8 @@ def main():
                        help='强制重建缓存 (即使已存在)')
     parser.add_argument('--verify-only', '-v', action='store_true',
                        help='仅验证现有缓存，不构建')
+    parser.add_argument('--skip-stats', action='store_true',
+                       help='跳过统计计算 (加快速构建, 默认含体方案)')
     parser.add_argument('--quiet', '-q', action='store_true',
                        help='安静模式')
     
@@ -297,9 +313,9 @@ def main():
             success = all(builder.verify_cache(split) for split in ['train', 'test'])
     else:
         if args.split:
-            _, success = builder.build_cache(args.split, args.force)
+            _, success = builder.build_cache(args.split, args.force, skip_stats=args.skip_stats)
         else:
-            success = builder.build_all(args.force)
+            success = builder.build_all(args.force, skip_stats=args.skip_stats)
     
     sys.exit(0 if success else 1)
 
