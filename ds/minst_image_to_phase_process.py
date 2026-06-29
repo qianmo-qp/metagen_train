@@ -228,7 +228,7 @@ class OptimizedPhaseConverter:
                     
                     # 生成编号（01-06 for train, 01 for test）
                     chunk_num = chunk_id + 1
-                    chunk_filename = f'phase_{split}_{chunk_num:02d}.npz'
+                    chunk_filename = f'minst_phase_{split}_{chunk_num:02d}.npz'
                     chunk_path = os.path.join(output_split_dir, chunk_filename)
                     
                     # 保存 NPZ 文件
@@ -381,14 +381,14 @@ class OptimizedPhaseConverter:
         print(f"\n生成的文件结构:")
         print(f"{self.output_dir}/")
         print(f"├── train/")
-        print(f"│   ├── phase_train_01.npz  (样本 0-9999)")
-        print(f"│   ├── phase_train_02.npz  (样本 10000-19999)")
-        print(f"│   ├── phase_train_03.npz  (样本 20000-29999)")
-        print(f"│   ├── phase_train_04.npz  (样本 30000-39999)")
-        print(f"│   ├── phase_train_05.npz  (样本 40000-49999)")
-        print(f"│   └── phase_train_06.npz  (样本 50000-59999)")
+        print(f"│   ├── minst_phase_train_01.npz  (样本 0-9999)")
+        print(f"│   ├── minst_phase_train_02.npz  (样本 10000-19999)")
+        print(f"│   ├── minst_phase_train_03.npz  (样本 20000-29999)")
+        print(f"│   ├── minst_phase_train_04.npz  (样本 30000-39999)")
+        print(f"│   ├── minst_phase_train_05.npz  (样本 40000-49999)")
+        print(f"│   └── minst_phase_train_06.npz  (样本 50000-59999)")
         print(f"└── test/")
-        print(f"    └── phase_test_01.npz   (样本 0-9999)")
+        print(f"    └── minst_phase_test_01.npz   (样本 0-9999)")
         print(f"\n每个 NPZ 文件包含:")
         print(f"  - 'phase': (N, {self.resolution}, {self.resolution}) float32 相位数据")
         print(f"  - 'labels': (N,) int64 标签 (0-9)")

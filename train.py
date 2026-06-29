@@ -37,8 +37,8 @@ def load_phase_data(data_dir='data/minst_phase', use_cache=True):
        - minst_phase_test.npz (包含 phase 和 labels)
     
     2. 分块 NPZ 文件：
-       - train/phase_train_01.npz, phase_train_02.npz, ...
-       - test/phase_test_01.npz
+       - train/minst_phase_train_01.npz, minst_phase_train_02.npz, ...
+       - test/minst_phase_test_01.npz
     """
     # Handle both relative and absolute paths
     if not os.path.isabs(data_dir) and not os.path.exists(data_dir):
@@ -115,7 +115,7 @@ def _load_chunked_npz(data_dir, split):
     
     # 查找所有分块 NPZ 文件
     npz_files = sorted([f for f in os.listdir(split_dir) 
-                       if f.startswith(f'phase_{split}_') and f.endswith('.npz')])
+                       if f.startswith(f'minst_phase_{split}_') and f.endswith('.npz')])
     
     if not npz_files:
         return None, None
