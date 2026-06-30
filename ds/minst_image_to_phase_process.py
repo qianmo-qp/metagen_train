@@ -142,10 +142,23 @@ class OptimizedPhaseConverter:
         phase_data = np.zeros((batch_size, self.resolution, self.resolution), dtype=np.float32)
         labels_data = np.zeros(batch_size, dtype=np.int64)
         
+        # 实时反馈处理进度
+        import time
+        start_time = time.time()
+        log_interval = max(1, batch_size // 10)  # 每处理 10% 输出一次日志
+        
         for idx in range(batch_size):
             image_idx = start_idx + idx
             phase_data[idx] = self.image_to_phase(images[image_idx]).astype(np.float32)
             labels_data[idx] = labels[image_idx]
+            
+            # 每处理 log_interval 个样本输出一次进度
+            if (idx + 1) % log_interval == 0 or idx + 1 == batch_size:
+                elapsed = time.time() - start_time
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                progress_pct = (idx + 1) / batch_size * 100
+                print(f"    [batch {start_idx}-{end_idx}] 处理进度: {idx + 1}/{batch_size} ({progress_pct:.1f}%) "
+                      f"[{elapsed:.1f}s, {rate:.1f} img/s]")
         
         return phase_data, labels_data
     
@@ -232,11 +245,17 @@ class OptimizedPhaseConverter:
                     chunk_path = os.path.join(output_split_dir, chunk_filename)
                     
                     # 保存 NPZ 文件
+                    if self.verbose:
+                        print(f"  正在保存: {chunk_filename} ({phase_data.nbytes / (1024**2):.1f} MB)...", end='', flush=True)
+                    
                     np.savez(
                         chunk_path,
                         phase=phase_data,
                         labels=labels_data
                     )
+                    
+                    if self.verbose:
+                        print(f" ✓ 完成")
                     
                     pbar.update(1)
                 
