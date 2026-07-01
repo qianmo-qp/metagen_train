@@ -204,11 +204,11 @@ class ConditionalDiT(nn.Module):
     def __init__(
         self,
         img_size=256,
-        patch_size=16,
+        patch_size=8,
         in_channels=1,
-        hidden_dim=192,
-        num_heads=3,
-        num_layers=6,
+        hidden_dim=384,
+        num_heads=6,
+        num_layers=12,
         time_dim=256,
         num_classes=10,
         mlp_ratio=4,
@@ -299,7 +299,7 @@ class ConditionalDiT(nn.Module):
 
 if __name__ == "__main__":
     # Quick test
-    model = ConditionalDiT(img_size=256, patch_size=16)
+    model = ConditionalDiT(img_size=256, patch_size=8, hidden_dim=384, num_heads=6, num_layers=12)
     x = torch.randn(2, 1, 256, 256)
     t = torch.randint(0, 1000, (2,))
     c = torch.randint(0, 10, (2,))

@@ -380,12 +380,12 @@ def main():
             'learning_rate': 1e-4,
             'timesteps': 1000,
             'model_type': 'ConditionalDiT',
-            'data_type': 'phase_hologram',  # 新增
-            'img_size': 256,                # 更新
-            'patch_size': 64,               # 更新
-            'hidden_dim': 192,
-            'num_layers': 6,
-            'num_heads': 3,
+            'data_type': 'phase_hologram',
+            'img_size': 256,
+            'patch_size': 8,
+            'hidden_dim': 384,
+            'num_layers': 12,
+            'num_heads': 6,
         }
     )
     print("✅ W&B initialized")
@@ -420,15 +420,15 @@ def main():
     
     # Create model and diffusion
     print("Creating model...")
-    # 注意: 相位数据是256×256, 而不是28×28
-    # 使用64×64 patch (4x4 patches = 16个token)
+    # 相位数据 256×256, patch_size=8 → 32×32=1024 tokens
+    # 增大模型容量: hidden_dim=384, num_layers=12, num_heads=6
     model = ConditionalDiT(
-        img_size=256,           # 改为256 (相位数据分辨率)
-        patch_size=64,          # 改为64 (256/64 = 4, 共16个token)
+        img_size=256,
+        patch_size=8,            # 256/8 = 32, 32×32 = 1024 tokens
         in_channels=1,
-        hidden_dim=192,
-        num_heads=3,
-        num_layers=6,
+        hidden_dim=384,          # 192 → 384
+        num_heads=6,             # 3 → 6
+        num_layers=12,           # 6 → 12
         time_dim=256,
         num_classes=10,
         mlp_ratio=4,
