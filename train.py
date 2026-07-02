@@ -392,7 +392,7 @@ def main():
     
     # Hyperparameters
     num_epochs = 400  # 增加到400获得更优的模型
-    batch_size = 128
+    batch_size = 32
     learning_rate = 1e-4
     timesteps = 1000
     sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
