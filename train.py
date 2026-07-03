@@ -383,17 +383,17 @@ def main():
             'data_type': 'phase_hologram',
             'img_size': 256,
             'patch_size': 8,
-            'hidden_dim': 384,
+            'hidden_dim': 768,
             'num_layers': 12,
-            'num_heads': 6,
+            'num_heads': 12,
         }
     )
     print("✅ W&B initialized")
     
     # Hyperparameters
-    num_epochs = 400  # 增加到400获得更优的模型
-    batch_size = 32
-    learning_rate = 1e-4
+    num_epochs = 400
+    batch_size = 128
+    learning_rate = 3e-5
     timesteps = 1000
     sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
     
@@ -421,14 +421,14 @@ def main():
     # Create model and diffusion
     print("Creating model...")
     # 相位数据 256×256, patch_size=8 → 32×32=1024 tokens
-    # 增大模型容量: hidden_dim=384, num_layers=12, num_heads=6
+    # Flash Attention + DiT-B 级模型: hidden_dim=768, num_layers=12, num_heads=12 (~114M)
     model = ConditionalDiT(
         img_size=256,
         patch_size=8,            # 256/8 = 32, 32×32 = 1024 tokens
         in_channels=1,
-        hidden_dim=384,          # 192 → 384
-        num_heads=6,             # 3 → 6
-        num_layers=12,           # 6 → 12
+        hidden_dim=768,          # 384 → 768 (DiT-B level)
+        num_heads=12,            # 6 → 12
+        num_layers=12,
         time_dim=256,
         num_classes=10,
         mlp_ratio=4,

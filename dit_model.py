@@ -141,15 +141,17 @@ class AdaLayerNorm(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """Transformer block with AdaLN conditioning."""
+    """Transformer block with AdaLN conditioning + Flash Attention."""
     
     def __init__(self, hidden_dim, num_heads, mlp_ratio=4, cond_dim=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
-        # Multi-head self-attention
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        # QKV projection (replaces nn.MultiheadAttention)
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=False)
+        self.attn_out = nn.Linear(hidden_dim, hidden_dim, bias=False)
         
         # MLP feedforward
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
@@ -171,9 +173,20 @@ class DiTBlock(nn.Module):
         Returns:
             (batch_size, seq_len, hidden_dim)
         """
-        # Self-attention with adaptive norm
+        B, L, _ = x.shape
+        
+        # Self-attention with adaptive norm + Flash Attention
         x_norm = self.norm1(x, cond)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        
+        # QKV: (B, L, 3*hidden) -> 3 x (B, heads, L, head_dim)
+        qkv = self.qkv(x_norm).reshape(B, L, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, L, head_dim)
+        q, k, v = qkv.unbind(0)            # each: (B, heads, L, head_dim)
+        
+        # Flash Attention (O(seq) memory, 2-4x faster)
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, self.hidden_dim)
+        attn_out = self.attn_out(attn_out)
         x = x + attn_out
         
         # MLP with adaptive norm
@@ -206,8 +219,8 @@ class ConditionalDiT(nn.Module):
         img_size=256,
         patch_size=8,
         in_channels=1,
-        hidden_dim=384,
-        num_heads=6,
+        hidden_dim=768,
+        num_heads=12,
         num_layers=12,
         time_dim=256,
         num_classes=10,
@@ -298,8 +311,8 @@ class ConditionalDiT(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick test
-    model = ConditionalDiT(img_size=256, patch_size=8, hidden_dim=384, num_heads=6, num_layers=12)
+    # Quick test: DiT-B level (114M params, Flash Attention)
+    model = ConditionalDiT(img_size=256, patch_size=8, hidden_dim=768, num_heads=12, num_layers=12)
     x = torch.randn(2, 1, 256, 256)
     t = torch.randint(0, 1000, (2,))
     c = torch.randint(0, 10, (2,))
