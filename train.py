@@ -384,9 +384,9 @@ def main():
         name='conditional_dit_phase_hologram',
         config={
             'num_epochs': 400,
-            'batch_size': 32,
+            'batch_size': 64,
             'effective_batch_size': 128,
-            'gradient_accumulation_steps': 4,
+            'gradient_accumulation_steps': 2,
             'learning_rate': 3e-5,
             'timesteps': 1000,
             'model_type': 'ConditionalDiT',
@@ -402,7 +402,7 @@ def main():
     
     # Hyperparameters
     num_epochs = 400
-    batch_size = 32
+    batch_size = 64
     learning_rate = 3e-5
     timesteps = 1000
     sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
@@ -463,7 +463,7 @@ def main():
         learning_rate=learning_rate,
         num_epochs=num_epochs,
         batch_size=batch_size,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         log_interval=100,
         use_wandb=True,
         sample_interval=sample_interval,
