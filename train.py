@@ -167,6 +167,7 @@ class Trainer:
         batch_size=128,
         checkpoint_dir='checkpoints',
         log_interval=100,
+        gradient_accumulation_steps=4,
         use_wandb=False,
         sample_interval=10,
     ):
@@ -179,6 +180,7 @@ class Trainer:
         self.log_interval = log_interval
         self.use_wandb = use_wandb
         self.sample_interval = sample_interval
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
         self.loss_fn = nn.MSELoss()
@@ -205,21 +207,23 @@ class Trainer:
             # Forward diffusion: add noise
             x_t, noise = self.diffusion.q_sample(images, t)
             
-            # Predict noise
-            self.optimizer.zero_grad()
+            # Predict noise (scaled loss for gradient accumulation)
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 1 or self.gradient_accumulation_steps == 1:
+                self.optimizer.zero_grad()
             noise_pred = self.model(x_t, t, labels)
             
-            # Compute loss
-            loss = self.loss_fn(noise_pred, noise)
+            # Compute loss (scaled for gradient accumulation)
+            loss = self.loss_fn(noise_pred, noise) / self.gradient_accumulation_steps
             loss.backward()
+            unscaled_loss = loss.item() * self.gradient_accumulation_steps
             
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Gradient clipping & optimizer step every N steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
             
-            self.optimizer.step()
-            
-            epoch_loss += loss.item()
-            self.losses.append(loss.item())
+            epoch_loss += unscaled_loss
+            self.losses.append(unscaled_loss)
             self.step += 1
             
             if (batch_idx + 1) % self.log_interval == 0:
@@ -352,6 +356,10 @@ class Trainer:
 
 
 def main():
+    # Reduce CUDA memory fragmentation for large models
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # Setup
     # Check CUDA availability
     cuda_available = torch.cuda.is_available()
@@ -373,11 +381,13 @@ def main():
     print("\n📊 Initializing W&B...")
     wandb.init(
         project='minst',
-        name='conditional_dit_phase_hologram',  # 更新为相位全息图
+        name='conditional_dit_phase_hologram',
         config={
-            'num_epochs': 100,
-            'batch_size': 128,
-            'learning_rate': 1e-4,
+            'num_epochs': 400,
+            'batch_size': 32,
+            'effective_batch_size': 128,
+            'gradient_accumulation_steps': 4,
+            'learning_rate': 3e-5,
             'timesteps': 1000,
             'model_type': 'ConditionalDiT',
             'data_type': 'phase_hologram',
@@ -392,7 +402,7 @@ def main():
     
     # Hyperparameters
     num_epochs = 400
-    batch_size = 128
+    batch_size = 32
     learning_rate = 3e-5
     timesteps = 1000
     sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
@@ -453,9 +463,10 @@ def main():
         learning_rate=learning_rate,
         num_epochs=num_epochs,
         batch_size=batch_size,
+        gradient_accumulation_steps=4,
         log_interval=100,
-        use_wandb=True,  # 启用W&B
-        sample_interval=sample_interval,  # 每10个epoch采样
+        use_wandb=True,
+        sample_interval=sample_interval,
     )
     
     losses = trainer.train(train_loader)
