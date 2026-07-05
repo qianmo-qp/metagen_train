@@ -2,11 +2,25 @@
 # DDP Training Launch Script for Multi-GPU Training
 # Usage: ./scripts/train_ddp.sh [num_gpus]
 
-# Default to 4 GPUs if not specified
-NUM_GPUS=${1:-4}
+# Detect available GPUs
+AVAILABLE_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
+if [ "$AVAILABLE_GPUS" -eq 0 ]; then
+    echo "❌ No GPUs detected!"
+    exit 1
+fi
 
-# Set environment variables
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# Default to all available GPUs
+NUM_GPUS=${1:-$AVAILABLE_GPUS}
+
+# Validate: don't exceed available GPUs
+if [ "$NUM_GPUS" -gt "$AVAILABLE_GPUS" ]; then
+    echo "⚠️  Requested $NUM_GPUS GPUs but only $AVAILABLE_GPUS available. Using $AVAILABLE_GPUS."
+    NUM_GPUS=$AVAILABLE_GPUS
+fi
+
+# Dynamically set CUDA_VISIBLE_DEVICES
+CUDA_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
+export CUDA_VISIBLE_DEVICES=$CUDA_DEVICES
 export OMP_NUM_THREADS=1
 
 # Get timestamp for log file
