@@ -550,7 +550,7 @@ def main():
     
     # Wrap model in DDP if distributed
     if is_distributed:
-        model = DDP(model.to(device), device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model.to(device), device_ids=[local_rank], find_unused_parameters=True)
         if rank == 0:
             print(f"✅ Model wrapped in DDP")
     
