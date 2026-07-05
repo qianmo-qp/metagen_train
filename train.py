@@ -341,7 +341,9 @@ class Trainer:
                 try:
                     self.generate_samples(epoch + 1)
                 except Exception as e:
+                    import traceback
                     self.logger.error(f"Error during sampling: {e}")
+                    self.logger.error(f"Traceback:\n{traceback.format_exc()}")
             
             # Log epoch metrics to W&B
             if self.use_wandb:
