@@ -7,7 +7,10 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from pathlib import Path
 import subprocess
@@ -25,6 +28,30 @@ from diffusion import create_diffusion
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
+
+
+def setup_distributed():
+    """Initialize DDP process group and return rank, world_size, local_rank."""
+    if 'RANK' not in os.environ:
+        # Single GPU mode
+        return 0, 1, 0
+    
+    dist.init_process_group(backend='nccl')
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Clean up DDP process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process (rank 0)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def load_phase_data(data_dir='data/minst_phase'):
@@ -182,6 +209,9 @@ class Trainer:
         self.sample_interval = sample_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
         
+        # Check if model is wrapped in DDP
+        self.is_ddp = isinstance(model, DDP)
+        
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
         self.loss_fn = nn.MSELoss()
         
@@ -191,6 +221,10 @@ class Trainer:
         self.step = 0
         self.losses = []
         self.logger = logging.getLogger(__name__)
+    
+    def get_model(self):
+        """Get the underlying model (unwrap DDP if needed)."""
+        return self.model.module if self.is_ddp else self.model
     
     def train_epoch(self, train_loader):
         """Train for one epoch."""
@@ -228,10 +262,12 @@ class Trainer:
             
             if (batch_idx + 1) % self.log_interval == 0:
                 avg_loss = epoch_loss / (batch_idx + 1)
-                print(f"Step {self.step}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss:.6f}")
+                # Only print from rank 0
+                if is_main_process():
+                    print(f"Step {self.step}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss:.6f}")
                 
-                # Log to W&B
-                if self.use_wandb:
+                # Log to W&B (only from rank 0)
+                if self.use_wandb and is_main_process():
                     wandb.log({
                         "loss": avg_loss,
                         "step": self.step,
@@ -246,7 +282,7 @@ class Trainer:
         checkpoint = {
             'epoch': epoch,
             'step': self.step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self.get_model().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'losses': self.losses,
         }
@@ -274,7 +310,7 @@ class Trainer:
         
         # Use DDIM for fast sampling
         samples = self.diffusion.sample_ddim(
-            self.model,
+            self.get_model(),
             num_samples=10,
             num_classes=10,
             device=self.device,
@@ -322,21 +358,29 @@ class Trainer:
         plt.close()
         self.model.train()
     
-    def train(self, train_loader):
+    def train(self, train_loader, sampler=None):
         """Train for multiple epochs."""
-        print(f"Training on {self.device}")
-        print(f"Total epochs: {self.num_epochs}")
+        if is_main_process():
+            print(f"Training on {self.device}")
+            print(f"Total epochs: {self.num_epochs}")
         
         for epoch in range(self.num_epochs):
-            print(f"\n=== Epoch {epoch + 1}/{self.num_epochs} ===")
+            # Set epoch for DDP sampler (important for shuffling)
+            if sampler is not None and hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
+            
+            if is_main_process():
+                print(f"\n=== Epoch {epoch + 1}/{self.num_epochs} ===")
             avg_loss = self.train_epoch(train_loader)
-            print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.6f}")
+            if is_main_process():
+                print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.6f}")
             
-            # Save checkpoint
-            self.save_checkpoint(epoch + 1)
+            # Save checkpoint (only from rank 0)
+            if is_main_process():
+                self.save_checkpoint(epoch + 1)
             
-            # Generate samples every sample_interval epochs
-            if (epoch + 1) % self.sample_interval == 0:
+            # Generate samples every sample_interval epochs (only from rank 0)
+            if (epoch + 1) % self.sample_interval == 0 and is_main_process():
                 self.logger.info(f"Sampling at epoch {epoch + 1}")
                 try:
                     self.generate_samples(epoch + 1)
@@ -345,101 +389,147 @@ class Trainer:
                     self.logger.error(f"Error during sampling: {e}")
                     self.logger.error(f"Traceback:\n{traceback.format_exc()}")
             
-            # Log epoch metrics to W&B
-            if self.use_wandb:
-                # 不要用step参数,W&B会自动使用最后一个step
+            # Log epoch metrics to W&B (only from rank 0)
+            if self.use_wandb and is_main_process():
                 wandb.log({
                     "epoch_loss": avg_loss,
                     "epoch": epoch + 1,
-                })  # 移除step参数!
+                })
         
-        print("\nTraining complete!")
+        if is_main_process():
+            print("\nTraining complete!")
         return self.losses
 
 
 def main():
     # Reduce CUDA memory fragmentation for large models
-    import os
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
-    # Setup
-    # Check CUDA availability
-    cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        device = 'cuda'
-        print(f"✅ CUDA is available")
-        print(f"   Device: {torch.cuda.get_device_name(0)}")
-        print(f"   Compute Capability: {torch.cuda.get_device_capability(0)}")
-        print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    # Initialize distributed training
+    rank, world_size, local_rank = setup_distributed()
+    is_distributed = world_size > 1
+    
+    if is_distributed:
+        # Set device for this GPU
+        torch.cuda.set_device(local_rank)
+        device = f'cuda:{local_rank}'
+        
+        # Only rank 0 prints info
+        if rank == 0:
+            print(f"✅ DDP initialized: {world_size} GPUs")
+            for i in range(world_size):
+                print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"   Total GPU Memory: {torch.cuda.get_device_properties(0).total_memory * world_size / 1e9:.2f} GB")
     else:
-        device = 'cpu'
-        print(f"⚠️  CUDA not detected, using CPU")
-        print(f"   To use GPU, ensure NVIDIA drivers and CUDA are installed")
-        print(f"   Run: nvidia-smi (to check GPU)")
+        # Single GPU mode
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            device = 'cuda'
+            print(f"✅ CUDA is available")
+            print(f"   Device: {torch.cuda.get_device_name(0)}")
+            print(f"   Compute Capability: {torch.cuda.get_device_capability(0)}")
+            print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            device = 'cpu'
+            print(f"⚠️  CUDA not detected, using CPU")
     
-    print(f"\nUsing device: {device}")
+    if rank == 0:
+        print(f"\nUsing device: {device}")
     
-    # Initialize W&B
-    print("\n📊 Initializing W&B...")
-    wandb.init(
-        project='minst',
-        name='conditional_dit_phase_hologram',
-        config={
-            'num_epochs': 400,
-            'batch_size': 64,
-            'effective_batch_size': 128,
-            'gradient_accumulation_steps': 2,
-            'learning_rate': 3e-5,
-            'timesteps': 1000,
-            'model_type': 'ConditionalDiT',
-            'data_type': 'phase_hologram',
-            'img_size': 256,
-            'patch_size': 8,
-            'hidden_dim': 768,
-            'num_layers': 12,
-            'num_heads': 12,
-        }
-    )
-    print("✅ W&B initialized")
+    # Initialize W&B (only from rank 0)
+    if rank == 0:
+        print("\n📊 Initializing W&B...")
+        wandb.init(
+            project='minst',
+            name='conditional_dit_phase_hologram_ddp' if is_distributed else 'conditional_dit_phase_hologram',
+            config={
+                'num_epochs': 400,
+                'batch_size_per_gpu': 32 if is_distributed else 64,
+                'world_size': world_size,
+                'effective_batch_size': (32 if is_distributed else 64) * world_size,
+                'gradient_accumulation_steps': 1 if is_distributed else 2,
+                'learning_rate': 3e-5,
+                'timesteps': 1000,
+                'model_type': 'ConditionalDiT',
+                'data_type': 'phase_hologram',
+                'img_size': 256,
+                'patch_size': 8,
+                'hidden_dim': 768,
+                'num_layers': 12,
+                'num_heads': 12,
+            }
+        )
+        print("✅ W&B initialized")
     
     # Hyperparameters
     num_epochs = 400
-    batch_size = 64
+    batch_size_per_gpu = 32 if is_distributed else 64  # DDP: 32×4=128, Single: 64×2=128
+    gradient_accumulation_steps = 1 if is_distributed else 2
     learning_rate = 3e-5
     timesteps = 1000
-    sample_interval = 20  # 每20个epoch采样一次 (而不是10,减少计算)
+    sample_interval = 20
     
-    # Load phase hologram data
-    print("Loading phase hologram data...")
+    # Load phase hologram data (only from rank 0 to avoid disk contention)
+    if rank == 0:
+        print("Loading phase hologram data...")
     train_phase, train_labels, test_phase, test_labels = load_phase_data('data/minst_phase')
-    print(f"✅ Phase data loaded successfully!")
+    if rank == 0:
+        print(f"✅ Phase data loaded successfully!")
     
     # Normalize phase to [-1, 1]
     train_phase = normalize_phase_data(train_phase)
     if test_phase is not None:
         test_phase = normalize_phase_data(test_phase)
     
-    print(f"Train phase shape: {train_phase.shape}, dtype: {train_phase.dtype}")
-    print(f"  Range: [{train_phase.min():.4f}, {train_phase.max():.4f}]")
-    print(f"Train labels shape: {train_labels.shape}, dtype: {train_labels.dtype}")
+    if rank == 0:
+        print(f"Train phase shape: {train_phase.shape}, dtype: {train_phase.dtype}")
+        print(f"  Range: [{train_phase.min():.4f}, {train_phase.max():.4f}]")
+        print(f"Train labels shape: {train_labels.shape}, dtype: {train_labels.dtype}")
     
-    # Create dataset
+    # Create dataset and dataloader
     train_dataset = TensorDataset(
         torch.from_numpy(train_phase).float(),
         torch.from_numpy(train_labels).long()
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    
+    # Use DistributedSampler for DDP
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_per_gpu,
+            sampler=train_sampler,
+            num_workers=0,
+            pin_memory=True,
+        )
+    else:
+        train_sampler = None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_per_gpu,
+            shuffle=True,
+            num_workers=0
+        )
+    
+    if rank == 0:
+        print(f"Batch size per GPU: {batch_size_per_gpu}")
+        print(f"Total batch size: {batch_size_per_gpu * world_size * gradient_accumulation_steps}")
+        print(f"World size: {world_size}, Gradient accumulation: {gradient_accumulation_steps}")
     
     # Create model and diffusion
-    print("Creating model...")
-    # 相位数据 256×256, patch_size=8 → 32×32=1024 tokens
-    # Flash Attention + DiT-B 级模型: hidden_dim=768, num_layers=12, num_heads=12 (~114M)
+    if rank == 0:
+        print("Creating model...")
     model = ConditionalDiT(
         img_size=256,
-        patch_size=8,            # 256/8 = 32, 32×32 = 1024 tokens
+        patch_size=8,
         in_channels=1,
-        hidden_dim=768,          # 384 → 768 (DiT-B level)
-        num_heads=12,            # 6 → 12
+        hidden_dim=768,
+        num_heads=12,
         num_layers=12,
         time_dim=256,
         num_classes=10,
@@ -447,7 +537,8 @@ def main():
     )
     
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {num_params:,}")
+    if rank == 0:
+        print(f"Model parameters: {num_params:,}")
     
     diffusion = create_diffusion(timesteps=timesteps, schedule_type='cosine')
     
@@ -457,6 +548,12 @@ def main():
         if isinstance(attr, torch.Tensor):
             setattr(diffusion, attr_name, attr.to(device))
     
+    # Wrap model in DDP if distributed
+    if is_distributed:
+        model = DDP(model.to(device), device_ids=[local_rank], find_unused_parameters=False)
+        if rank == 0:
+            print(f"✅ Model wrapped in DDP")
+    
     # Train
     trainer = Trainer(
         model=model,
@@ -464,21 +561,23 @@ def main():
         device=device,
         learning_rate=learning_rate,
         num_epochs=num_epochs,
-        batch_size=batch_size,
-        gradient_accumulation_steps=2,
+        batch_size=batch_size_per_gpu,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         log_interval=100,
-        use_wandb=True,
+        use_wandb=(rank == 0),  # Only rank 0 logs to W&B
         sample_interval=sample_interval,
     )
     
-    losses = trainer.train(train_loader)
+    losses = trainer.train(train_loader, sampler=train_sampler)
     
-    print(f"\nTraining complete! Final checkpoint saved.")
-    print(f"Total steps: {trainer.step}")
+    # Cleanup
+    if rank == 0:
+        print(f"\nTraining complete! Final checkpoint saved.")
+        print(f"Total steps: {trainer.step}")
+        wandb.finish()
+        print("\n📊 W&B run finished")
     
-    # 关闭W&B
-    wandb.finish()
-    print("\n📊 W&B run finished")
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
