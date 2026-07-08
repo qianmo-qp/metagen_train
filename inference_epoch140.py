@@ -151,26 +151,24 @@ def recover_image_from_phase(phase, verbose=False):
     if verbose:
         print(f"  FFT 幅度: min={recovered.min():.6f}, max={recovered.max():.6f}, mean={recovered.mean():.6f}")
     
-    # 归一化策略：使用百分位数避免极值影响
-    # 方法1: 标准归一化（容易被极值影响）
-    recovered_norm = recovered / (np.max(recovered) + 1e-8)
-    
-    # 方法2: 99百分位数归一化（更鲁棒）
-    p99 = np.percentile(recovered, 99)
-    recovered_p99 = recovered / (p99 + 1e-8)
-    recovered_p99 = np.clip(recovered_p99, 0, 1)
-    
-    # 方法3: 使用对数增强对比度
+    # 使用对数 + 平方根增强对比度（最优方案）
+    # 策略: log(1 + x) 压缩动态范围，然后平方根进一步增强
     recovered_log = np.log1p(recovered)  # log(1 + x)
     recovered_log = recovered_log / (np.max(recovered_log) + 1e-8)
     
-    if verbose:
-        print(f"  归一化后: min={recovered_norm.min():.4f}, max={recovered_norm.max():.4f}, mean={recovered_norm.mean():.4f}")
-        print(f"  P99方法: min={recovered_p99.min():.4f}, max={recovered_p99.max():.4f}, mean={recovered_p99.mean():.4f}")
-        print(f"  对数方法: min={recovered_log.min():.4f}, max={recovered_log.max():.4f}, mean={recovered_log.mean():.4f}")
+    # 平方根并体插值增强（大幅增强中值）
+    recovered_enhanced = np.power(recovered_log, 0.5)  # 取平方根
     
-    # 使用 P99 方法作为默认（更好的对比度）
-    return recovered_p99
+    # 上限裁剪增强对比度（可选）
+    p_high = np.percentile(recovered_enhanced, 95)
+    recovered_enhanced = np.clip(recovered_enhanced / p_high, 0, 1)
+    
+    if verbose:
+        print(f"  对数方法: min={recovered_log.min():.4f}, max={recovered_log.max():.4f}, mean={recovered_log.mean():.4f}")
+        print(f"  增强后: min={recovered_enhanced.min():.4f}, max={recovered_enhanced.max():.4f}, mean={recovered_enhanced.mean():.4f}")
+    
+    # 使用对数 + 增强方案作为默认（最佳对比度）
+    return recovered_enhanced
 
 
 def phase_to_color_image(phase):
