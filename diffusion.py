@@ -164,8 +164,8 @@ class DiffusionSchedule:
         Args:
             model: Denoising model
             x_t: Noisy image at timestep t
-            t: Current timestep
-            t_next: Next timestep (t-1)
+            t: Current timestep (batch tensor or scalar)
+            t_next: Next timestep (t-1, batch tensor or scalar)
             c: Class conditioning
             eta: Stochasticity parameter (0.0 = deterministic, 1.0 = stochastic LIKE DDPM)
             clip_denoised: Clip denoised prediction to [-1, 1]
@@ -175,11 +175,18 @@ class DiffusionSchedule:
         # Model predicts noise
         predicted_noise = model(x_t, t, c)
         
+        # Extract scalar timestep values for indexing alphas_cumprod
+        # If t is a batch tensor, all elements should be the same (from torch.full)
+        if isinstance(t, torch.Tensor):
+            t_scalar = t.view(-1)[0].item()  # Get first element and convert to scalar
+            t_next_scalar = t_next.view(-1)[0].item()
+        else:
+            t_scalar = t
+            t_next_scalar = t_next
+        
         # Get alpha values
-        alpha_t = self.alphas_cumprod[t]
-        # Handle both scalar and tensor t_next
-        t_next_val = t_next.item() if isinstance(t_next, torch.Tensor) else t_next
-        alpha_next = self.alphas_cumprod[t_next] if t_next_val >= 0 else torch.ones_like(alpha_t)
+        alpha_t = self.alphas_cumprod[t_scalar]
+        alpha_next = self.alphas_cumprod[t_next_scalar] if t_next_scalar >= 0 else torch.ones_like(alpha_t)
         
         # Predict x_0 from x_t
         sqrt_alpha_t = torch.sqrt(alpha_t).view(-1, 1, 1, 1)
