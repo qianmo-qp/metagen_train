@@ -177,7 +177,9 @@ class DiffusionSchedule:
         
         # Get alpha values
         alpha_t = self.alphas_cumprod[t]
-        alpha_next = self.alphas_cumprod[t_next] if t_next >= 0 else torch.ones_like(alpha_t)
+        # Handle both scalar and tensor t_next
+        t_next_val = t_next.item() if isinstance(t_next, torch.Tensor) else t_next
+        alpha_next = self.alphas_cumprod[t_next] if t_next_val >= 0 else torch.ones_like(alpha_t)
         
         # Predict x_0 from x_t
         sqrt_alpha_t = torch.sqrt(alpha_t).view(-1, 1, 1, 1)
