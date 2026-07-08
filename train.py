@@ -221,6 +221,15 @@ class Trainer:
         self.step = 0
         self.losses = []
         self.logger = logging.getLogger(__name__)
+        self.best_loss = float('inf')
+        self.best_checkpoint_path = None
+        
+        # LR Scheduler: Cosine annealing
+        # T_max = total steps = num_epochs * steps_per_epoch
+        # Approximate: T_max = num_epochs * 1000 (assuming ~1000 steps per epoch with 60k samples)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs * 1000, eta_min=1e-7
+        )
     
     def get_model(self):
         """Get the underlying model (unwrap DDP if needed)."""
@@ -255,6 +264,7 @@ class Trainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                self.scheduler.step()  # Update LR after each step
             
             epoch_loss += unscaled_loss
             self.losses.append(unscaled_loss)
@@ -277,83 +287,127 @@ class Trainer:
         
         return epoch_loss / len(train_loader)
     
-    def save_checkpoint(self, epoch, is_best=False):
-        """Save model checkpoint."""
+    def save_checkpoint(self, epoch, loss=None, is_best=False):
+        """Save model checkpoint and track best loss."""
         checkpoint = {
             'epoch': epoch,
             'step': self.step,
             'model_state_dict': self.get_model().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if hasattr(self, 'scheduler') else None,
             'losses': self.losses,
+            'loss': loss,
         }
         
         checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
         torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
+        if is_main_process():
+            print(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Track best loss
+        if loss is not None and loss < self.best_loss:
+            self.best_loss = loss
+            self.best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
+            torch.save(checkpoint, self.best_checkpoint_path)
+            if is_main_process():
+                print(f"🏆 Saved best model (loss={loss:.6f}) to {self.best_checkpoint_path}")
         
         if is_best:
+            # Force save as best
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
             torch.save(checkpoint, best_path)
-            print(f"Saved best model to {best_path}")
+            if is_main_process():
+                print(f"Saved best model to {best_path}")
     
     def generate_samples(self, epoch):
-        """Generate samples using DDIM and optionally log to W&B."""
+        """Generate recovered digit samples using DDIM and log to W&B."""
         import matplotlib.pyplot as plt
         from PIL import Image
         import io
+        import numpy as np
         
         self.logger.info(f"Generating samples at epoch {epoch}...")
         self.model.eval()
         
-        # Generate 1 sample per class using DDIM (50 steps = ~6 seconds)
+        # Generate 1 sample per class (0-9) using DDIM
         class_labels = torch.arange(10, device=self.device)
         
-        # Use DDIM for fast sampling
+        # Use DDIM for sampling
         samples = self.diffusion.sample_ddim(
             self.get_model(),
             num_samples=10,
             num_classes=10,
             device=self.device,
-            num_steps=100,     # DDIM: 100 steps (更好质量!)
+            num_steps=100,     # DDIM: 100 steps
             eta=0.0,           # Deterministic sampling
             class_labels=class_labels
+            # img_size will be auto-detected from model
         )
         
-        # Denormalize
-        samples = (samples + 1.0) / 2.0
-        samples = torch.clamp(samples, 0.0, 1.0)
+        # samples shape: (10, 1, 256, 256) for phase, values in [-1, 1]
+        # Convert to phase range [-π, π]
+        phase_samples = samples * np.pi  # Now in [-π, π]
         
-        # Create grid image
+        # Helper function: recover image from phase (FFT)
+        def recover_phase(phase_array):
+            """Recover digit from phase hologram using FFT."""
+            # Phase → complex wave front
+            u1 = np.exp(1j * phase_array)
+            
+            # FFT inverse transform
+            u2 = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u1)))
+            
+            # Take magnitude
+            recovered = np.abs(u2)
+            
+            # Log + sqrt enhancement for contrast
+            recovered_log = np.log1p(recovered)
+            recovered_log = recovered_log / (np.max(recovered_log) + 1e-8)
+            recovered_enhanced = np.power(recovered_log, 0.5)
+            
+            # P95 clipping
+            p_high = np.percentile(recovered_enhanced, 95)
+            recovered_enhanced = np.clip(recovered_enhanced / p_high, 0, 1)
+            
+            return recovered_enhanced
+        
+        # Create figure with recovered digits
         fig, axes = plt.subplots(2, 5, figsize=(15, 6))
         axes = axes.flatten()
         
-        for idx in range(10):
-            axes[idx].imshow(samples[idx, 0].cpu().numpy(), cmap='gray')
-            axes[idx].set_title(f'Class {idx}')
-            axes[idx].axis('off')
+        for digit_class in range(10):
+            phase = phase_samples[digit_class, 0].cpu().numpy()  # (256, 256)
+            recovered_digit = recover_phase(phase)
+            
+            axes[digit_class].imshow(recovered_digit, cmap='gray')
+            axes[digit_class].set_title(f'Digit {digit_class}')
+            axes[digit_class].axis('off')
         
+        plt.suptitle(f'Epoch {epoch} - Recovered Digits (Num Steps=100)', fontsize=14, y=1.02)
         plt.tight_layout()
         
         # Save locally
-        sample_path = os.path.join('outputs', f'generated_samples_epoch_{epoch}.png')
+        sample_path = os.path.join('outputs', f'recovered_digits_epoch_{epoch}.png')
         Path('outputs').mkdir(exist_ok=True)
         plt.savefig(sample_path, dpi=100, bbox_inches='tight')
-        self.logger.info(f"Saved samples to {sample_path}")
+        self.logger.info(f"Saved recovered digits to {sample_path}")
         
-        # Log to W&B with correct step counter
+        # Log to W&B
         if self.use_wandb:
-            # Convert to PIL Image for W&B
             buf = io.BytesIO()
             plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
             buf.seek(0)
             pil_image = Image.open(buf)
+            pil_image.load()  # Load to avoid BytesIO closure
             
-            # Use monotonically increasing step (current step, not epoch)
+            # Create a copy to keep in memory
+            pil_image_copy = pil_image.copy()
+            
             wandb.log({
-                f"samples_epoch_{epoch}": wandb.Image(pil_image),
+                f"recovered_digits_epoch_{epoch}": wandb.Image(pil_image_copy),
                 "epoch": epoch,
-            }, step=self.step)  # ← 使用self.step而不是epoch!
-            self.logger.info(f"Logged samples to W&B for epoch {epoch} at step {self.step}")
+            }, step=self.step)
+            self.logger.info(f"Logged recovered digits to W&B for epoch {epoch}")
         
         plt.close()
         self.model.train()
@@ -377,7 +431,7 @@ class Trainer:
             
             # Save checkpoint (only from rank 0)
             if is_main_process():
-                self.save_checkpoint(epoch + 1)
+                self.save_checkpoint(epoch + 1, loss=avg_loss)
             
             # Generate samples every sample_interval epochs (only from rank 0)
             if (epoch + 1) % self.sample_interval == 0 and is_main_process():
@@ -463,11 +517,11 @@ def main():
     
     # Hyperparameters
     num_epochs = 400
-    batch_size_per_gpu = 32 if is_distributed else 64  # DDP: 32×4=128, Single: 64×2=128
+    batch_size_per_gpu = 32 if is_distributed else 64  # DDP: 32×N=128+, Single: 64×2=128
     gradient_accumulation_steps = 1 if is_distributed else 2
     learning_rate = 3e-5
     timesteps = 1000
-    sample_interval = 20
+    sample_interval = 10  # Generate recovered digits every 10 epochs
     
     # Load phase hologram data (only from rank 0 to avoid disk contention)
     if rank == 0:
