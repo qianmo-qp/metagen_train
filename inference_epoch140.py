@@ -127,12 +127,13 @@ def normalize_phase(phase_values):
     return (phase_values + np.pi) / (2 * np.pi)
 
 
-def recover_image_from_phase(phase):
+def recover_image_from_phase(phase, verbose=False):
     """
     恢复图像: 从相位全息图恢复 MNIST 数字图像 (FFT反向变换)
     
     Args:
         phase: 相位数组 [-π, π], shape (256, 256)
+        verbose: 打印调试信息
     
     Returns:
         recovered: 恢复的图像 [0, 1], shape (256, 256)
@@ -146,10 +147,30 @@ def recover_image_from_phase(phase):
     # 取幅度
     recovered = np.abs(u2)
     
-    # 归一化到 [0, 1]
-    recovered = recovered / (np.max(recovered) + 1e-8)
+    # 统计信息
+    if verbose:
+        print(f"  FFT 幅度: min={recovered.min():.6f}, max={recovered.max():.6f}, mean={recovered.mean():.6f}")
     
-    return recovered
+    # 归一化策略：使用百分位数避免极值影响
+    # 方法1: 标准归一化（容易被极值影响）
+    recovered_norm = recovered / (np.max(recovered) + 1e-8)
+    
+    # 方法2: 99百分位数归一化（更鲁棒）
+    p99 = np.percentile(recovered, 99)
+    recovered_p99 = recovered / (p99 + 1e-8)
+    recovered_p99 = np.clip(recovered_p99, 0, 1)
+    
+    # 方法3: 使用对数增强对比度
+    recovered_log = np.log1p(recovered)  # log(1 + x)
+    recovered_log = recovered_log / (np.max(recovered_log) + 1e-8)
+    
+    if verbose:
+        print(f"  归一化后: min={recovered_norm.min():.4f}, max={recovered_norm.max():.4f}, mean={recovered_norm.mean():.4f}")
+        print(f"  P99方法: min={recovered_p99.min():.4f}, max={recovered_p99.max():.4f}, mean={recovered_p99.mean():.4f}")
+        print(f"  对数方法: min={recovered_log.min():.4f}, max={recovered_log.max():.4f}, mean={recovered_log.mean():.4f}")
+    
+    # 使用 P99 方法作为默认（更好的对比度）
+    return recovered_p99
 
 
 def phase_to_color_image(phase):
@@ -180,17 +201,18 @@ def phase_to_color_image(phase):
     return image
 
 
-def phase_to_recovered_image(phase):
+def phase_to_recovered_image(phase, verbose=False):
     """
     相位 → 恢复数字图像 PNG
     
     Args:
         phase: 相位数组 [-π, π], shape (256, 256)
+        verbose: 打印调试信息
     
     Returns:
         img: PIL Image (L mode, grayscale)
     """
-    recovered = recover_image_from_phase(phase)
+    recovered = recover_image_from_phase(phase, verbose=verbose)
     recovered_uint8 = (recovered * 255).astype(np.uint8)
     return Image.fromarray(recovered_uint8, mode='L')
 
@@ -237,7 +259,7 @@ def create_comparison_image(phase, digit_label):
     plt.close(fig2)
     
     # 3. 恢复的数字图像
-    recovered = recover_image_from_phase(phase)
+    recovered = recover_image_from_phase(phase, verbose=False)
     recovered_uint8 = (recovered * 255).astype(np.uint8)
     fig3, ax3 = plt.subplots(figsize=(4, 4), dpi=50)
     ax3.imshow(recovered_uint8, cmap='gray')
@@ -317,6 +339,7 @@ def save_phase_npy(samples, labels, output_dir='outputs/inference_epoch140'):
     
     print(f"\n💾 保存生成的相位和恢复图像...")
     
+    first_sample = True
     for class_id in range(10):
         class_mask = labels == class_id
         class_samples = samples[class_mask]  # (batch_size, 1, 256, 256)
@@ -324,12 +347,18 @@ def save_phase_npy(samples, labels, output_dir='outputs/inference_epoch140'):
         for idx, sample in enumerate(class_samples):
             phase = sample[0].numpy()  # (256, 256), 范围 [-π, π]
             
+            # 第一个样本打印调试信息
+            verbose = first_sample
+            if verbose:
+                print(f"  [样本 0] 相位统计: min={phase.min():.4f}, max={phase.max():.4f}, mean={phase.mean():.4f}")
+                first_sample = False
+            
             # 1. 保存原始相位 NPY
             phase_npy_path = os.path.join(phase_dir, f'phase_digit{class_id}_{idx:03d}.npy')
             np.save(phase_npy_path, phase)
             
             # 2. 恢复图像 PNG
-            recovered_img = phase_to_recovered_image(phase)
+            recovered_img = phase_to_recovered_image(phase, verbose=verbose)
             recovered_png_path = os.path.join(recovered_dir, f'digit{class_id}_{idx:03d}_recovered.png')
             recovered_img.save(recovered_png_path)
             
