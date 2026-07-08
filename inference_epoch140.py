@@ -162,18 +162,22 @@ def phase_to_color_image(phase):
     Returns:
         color_img: PIL Image (RGB)
     """
+    import matplotlib
+    matplotlib.use('Agg')
+    
     fig, ax = plt.subplots(figsize=(5, 5), dpi=50)
     im = ax.imshow(phase, cmap='twilight', vmin=-np.pi, vmax=np.pi)
     ax.axis('off')
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     
-    # 转为图像
+    # 转为 PIL Image
     fig.canvas.draw()
-    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    buf = fig.canvas.buffer_rgba()
+    image = Image.frombytes('RGBA', fig.canvas.get_width_height(), buf)
+    image = image.convert('RGB')
     
     plt.close(fig)
-    return Image.fromarray(image)
+    return image
 
 
 def phase_to_recovered_image(phase):
@@ -202,15 +206,22 @@ def create_comparison_image(phase, digit_label):
     Returns:
         comparison_img: PIL Image with 3 subplots side by side
     """
+    # 使用 Agg 后端避免 GUI 依赖
+    import matplotlib
+    matplotlib.use('Agg')
+    
     # 1. 相位彩色图
     fig1, ax1 = plt.subplots(figsize=(4, 4), dpi=50)
     im1 = ax1.imshow(phase, cmap='twilight', vmin=-np.pi, vmax=np.pi)
     ax1.set_title(f'Phase Hologram (Digit {digit_label})', fontsize=10)
     ax1.axis('off')
     plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    
+    # 转换为 PIL Image
     fig1.canvas.draw()
-    img1 = np.frombuffer(fig1.canvas.tostring_rgb(), dtype=np.uint8)
-    img1 = img1.reshape(fig1.canvas.get_width_height()[::-1] + (3,))
+    buf1 = fig1.canvas.buffer_rgba()
+    img1 = Image.frombytes('RGBA', fig1.canvas.get_width_height(), buf1)
+    img1 = img1.convert('RGB')
     plt.close(fig1)
     
     # 2. 相位灰度16bit
@@ -220,8 +231,9 @@ def create_comparison_image(phase, digit_label):
     ax2.set_title('Phase (8-bit Gray)', fontsize=10)
     ax2.axis('off')
     fig2.canvas.draw()
-    img2 = np.frombuffer(fig2.canvas.tostring_rgb(), dtype=np.uint8)
-    img2 = img2.reshape(fig2.canvas.get_width_height()[::-1] + (3,))
+    buf2 = fig2.canvas.buffer_rgba()
+    img2 = Image.frombytes('RGBA', fig2.canvas.get_width_height(), buf2)
+    img2 = img2.convert('RGB')
     plt.close(fig2)
     
     # 3. 恢复的数字图像
@@ -232,16 +244,18 @@ def create_comparison_image(phase, digit_label):
     ax3.set_title('Recovered Digit', fontsize=10)
     ax3.axis('off')
     fig3.canvas.draw()
-    img3 = np.frombuffer(fig3.canvas.tostring_rgb(), dtype=np.uint8)
-    img3 = img3.reshape(fig3.canvas.get_width_height()[::-1] + (3,))
+    buf3 = fig3.canvas.buffer_rgba()
+    img3 = Image.frombytes('RGBA', fig3.canvas.get_width_height(), buf3)
+    img3 = img3.convert('RGB')
     plt.close(fig3)
     
     # 并排组合
-    h = img1.shape[0]
-    w = img1.shape[1]
-    comparison = np.hstack([img1, img2, img3])
+    comparison = Image.new('RGB', (img1.width + img2.width + img3.width, img1.height))
+    comparison.paste(img1, (0, 0))
+    comparison.paste(img2, (img1.width, 0))
+    comparison.paste(img3, (img1.width + img2.width, 0))
     
-    return Image.fromarray(comparison)
+    return comparison
 
 
 def visualize_phase_holograms(samples, labels, output_path='generated_phases.png', nrow=10):
