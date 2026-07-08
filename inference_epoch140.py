@@ -89,6 +89,7 @@ def generate_phase_samples(
                     num_steps=num_steps,
                     eta=0.0,  # Deterministic
                     class_labels=class_labels
+                    # img_size will be auto-detected from model
                 )
             else:
                 # Full DDPM sampling (slow but highest quality)

@@ -241,7 +241,7 @@ class DiffusionSchedule:
 
     @torch.no_grad()
     def sample_ddim(self, model, num_samples, num_classes, device, 
-                   num_steps=50, eta=0.0, class_labels=None):
+                   num_steps=50, eta=0.0, class_labels=None, img_size=256):
         """
         Generate samples using DDIM (fast sampling).
         
@@ -250,11 +250,12 @@ class DiffusionSchedule:
             num_samples: Number of samples to generate
             num_classes: Number of classes
             device: Device to use
-            num_steps: Number of DDIM steps (default 50 for ~6 seconds)
+            num_steps: Number of DDIM steps (default 50 for ~30s at 256×256)
             eta: Stochasticity (0.0 = deterministic, 1.0 = stochastic)
             class_labels: If provided, use these labels (else sample uniformly)
+            img_size: Image size - 28 (MNIST) or 256 (phase hologram). Auto-detect from model if possible.
         Returns:
-            samples: Generated images (num_samples, 1, 28, 28) in [-1, 1]
+            samples: Generated images (num_samples, 1, img_size, img_size) in [-1, 1]
         """
         model.eval()
         
@@ -264,8 +265,14 @@ class DiffusionSchedule:
         
         class_labels = class_labels.to(device)
         
-        # Start from pure noise
-        x_t = torch.randn(len(class_labels), 1, 28, 28, device=device)
+        # Auto-detect img_size from model if it has img_size attribute
+        if hasattr(model, 'img_size'):
+            img_size = model.img_size
+        elif hasattr(model, 'module') and hasattr(model.module, 'img_size'):
+            img_size = model.module.img_size
+        
+        # Start from pure noise (adaptive to img_size)
+        x_t = torch.randn(len(class_labels), 1, img_size, img_size, device=device)
         
         # Create DDIM timesteps (more steps for better quality)
         # Using stride to uniformly sample timesteps from 999 to 0
