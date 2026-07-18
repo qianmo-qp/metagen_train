@@ -4,6 +4,7 @@ Training loop for Conditional DiT on MNIST with W&B monitoring.
 
 import os
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -189,7 +190,7 @@ class Trainer:
         model,
         diffusion,
         device,
-        learning_rate=1e-4,
+        learning_rate,
         num_epochs=10,
         batch_size=128,
         checkpoint_dir='checkpoints',
@@ -197,6 +198,9 @@ class Trainer:
         gradient_accumulation_steps=4,
         use_wandb=False,
         sample_interval=10,
+        warmup_epochs=3,
+        flat_epochs=97,
+        num_batches_per_epoch=938,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -208,11 +212,12 @@ class Trainer:
         self.use_wandb = use_wandb
         self.sample_interval = sample_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.learning_rate = learning_rate
         
         # Check if model is wrapped in DDP
         self.is_ddp = isinstance(model, DDP)
         
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
         self.loss_fn = nn.MSELoss()
         
         # Create checkpoint directory
@@ -223,22 +228,49 @@ class Trainer:
         self.logger = logging.getLogger(__name__)
         self.best_loss = float('inf')
         self.best_checkpoint_path = None
+        self.nan_count = 0  # Track consecutive NaN loss occurrences
+        self.nan_grad_count = 0  # Track consecutive NaN gradient norm occurrences
         
-        # LR Scheduler: Cosine annealing
-        # T_max = total steps = num_epochs * steps_per_epoch
-        # Approximate: T_max = num_epochs * 1000 (assuming ~1000 steps per epoch with 60k samples)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=num_epochs * 1000, eta_min=1e-7
-        )
+        # LR Scheduler: Linear warmup + Flat + Cosine decay
+        # Calculate actual optimizer steps
+        steps_per_epoch = num_batches_per_epoch // gradient_accumulation_steps
+        self.total_steps = num_epochs * steps_per_epoch
+        self.warmup_steps = warmup_epochs * steps_per_epoch
+        self.flat_steps = flat_epochs * steps_per_epoch
+        self.decay_start = self.warmup_steps + self.flat_steps  # Cosine decay starts here
+        
+        # Use LambdaLR for warmup + flat + cosine decay
+        def lr_lambda(current_step):
+            if current_step < self.warmup_steps:
+                # Linear warmup from 0.1x to 1.0x
+                return 0.1 + 0.9 * (current_step / self.warmup_steps)
+            elif current_step < self.decay_start:
+                # Flat phase: keep LR at peak
+                return 1.0
+            else:
+                # Cosine decay from 1.0x to eta_min_ratio
+                progress = (current_step - self.decay_start) / max(1, self.total_steps - self.decay_start)
+                eta_min_ratio = 1e-6 / learning_rate  # Decay to 1e-6
+                return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
+        if is_main_process():
+            print(f"LR Schedule: warmup {warmup_epochs} epochs ({self.warmup_steps} steps) "
+                  f"+ flat {flat_epochs} epochs ({self.flat_steps} steps) "
+                  f"+ cosine decay {num_epochs - warmup_epochs - flat_epochs} epochs")
+            print(f"  Peak LR: {learning_rate}, Min LR: 1e-6")
+            print(f"  Total optimizer steps: {self.total_steps}")
     
     def get_model(self):
         """Get the underlying model (unwrap DDP if needed)."""
         return self.model.module if self.is_ddp else self.model
     
     def train_epoch(self, train_loader):
-        """Train for one epoch."""
+        """Train for one epoch with NaN detection and gradient monitoring."""
         self.model.train()
         epoch_loss = 0.0
+        valid_batches = 0
         
         for batch_idx, (images, labels) in enumerate(train_loader):
             images = images.to(self.device)
@@ -257,38 +289,90 @@ class Trainer:
             
             # Compute loss (scaled for gradient accumulation)
             loss = self.loss_fn(noise_pred, noise) / self.gradient_accumulation_steps
+            
+            # NaN detection - skip this batch if loss is NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.nan_count += 1
+                if is_main_process():
+                    print(f"⚠️  NaN/Inf loss detected at step {self.step}, batch {batch_idx + 1} (count: {self.nan_count})")
+                self.optimizer.zero_grad()  # Clear any accumulated gradients
+                if self.nan_count >= 5:
+                    if is_main_process():
+                        print(f"🛑 {self.nan_count} consecutive NaN losses! Halving LR and loading best checkpoint...")
+                    self._recover_from_nan()
+                self.step += 1
+                continue
+            
+            self.nan_count = 0  # Reset loss NaN counter on valid loss
             loss.backward()
             unscaled_loss = loss.item() * self.gradient_accumulation_steps
             
             # Gradient clipping & optimizer step every N steps
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                self.scheduler.step()  # Update LR after each step
+                # Check gradient norm before stepping
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # Skip update if gradient is NaN/Inf
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    self.nan_grad_count += 1
+                    if self.nan_grad_count % 50 == 1 and is_main_process():
+                        print(f"⚠️  NaN/Inf gradient norm at step {self.step} (consecutive: {self.nan_grad_count}), skipping update")
+                    self.optimizer.zero_grad()
+                    
+                    # Trigger recovery on consecutive NaN gradients
+                    if self.nan_grad_count >= 20:
+                        if is_main_process():
+                            print(f"🛑 {self.nan_grad_count} consecutive NaN gradients! Loading best checkpoint and halving LR...")
+                        self._recover_from_nan()
+                else:
+                    self.nan_grad_count = 0  # Reset gradient NaN counter on valid grad
+                    self.optimizer.step()
+                    self.scheduler.step()  # Update LR after each valid step
             
             epoch_loss += unscaled_loss
+            valid_batches += 1
             self.losses.append(unscaled_loss)
             self.step += 1
             
             if (batch_idx + 1) % self.log_interval == 0:
-                avg_loss = epoch_loss / (batch_idx + 1)
+                avg_loss = epoch_loss / max(valid_batches, 1)
+                current_lr = self.optimizer.param_groups[0]['lr']
                 # Only print from rank 0
                 if is_main_process():
-                    print(f"Step {self.step}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss:.6f}")
+                    print(f"Step {self.step}, Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss:.6f}, LR: {current_lr:.2e}")
                 
                 # Log to W&B (only from rank 0)
                 if self.use_wandb and is_main_process():
                     wandb.log({
                         "loss": avg_loss,
+                        "learning_rate": current_lr,
+                        "grad_norm": grad_norm.item() if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)) else 0,
                         "step": self.step,
                         "batch": batch_idx + 1,
                         "epoch": int(self.step / len(train_loader)) + 1,
                     }, step=self.step)
         
-        return epoch_loss / len(train_loader)
+        return epoch_loss / max(valid_batches, 1)
+    
+    def _recover_from_nan(self):
+        """Recover from NaN by loading best checkpoint and reducing LR."""
+        best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
+        if os.path.exists(best_path):
+            checkpoint = torch.load(best_path, map_location=self.device)
+            self.get_model().load_state_dict(checkpoint['model_state_dict'])
+        # Reduce LR by 30% (not halve — avoid LR collapsing too fast)
+        self.scheduler.base_lrs = [lr * 0.7 for lr in self.scheduler.base_lrs]
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = param_group['lr'] * 0.7
+        if is_main_process():
+            if os.path.exists(best_path):
+                print(f"✅ Restored from best checkpoint (epoch {checkpoint.get('epoch', '?')}, loss={checkpoint.get('loss', '?')})")
+            print(f"   New base LR: {self.scheduler.base_lrs[0]:.2e}, current LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+        self.nan_count = 0
+        self.nan_grad_count = 0
     
     def save_checkpoint(self, epoch, loss=None, is_best=False):
-        """Save model checkpoint and track best loss."""
+        """Save model checkpoint — keep only latest and best."""
         checkpoint = {
             'epoch': epoch,
             'step': self.step,
@@ -299,117 +383,63 @@ class Trainer:
             'loss': loss,
         }
         
-        checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-        torch.save(checkpoint, checkpoint_path)
+        # Always overwrite latest checkpoint
+        latest_path = os.path.join(self.checkpoint_dir, 'checkpoint_latest.pt')
+        torch.save(checkpoint, latest_path)
         if is_main_process():
-            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Saved checkpoint (epoch {epoch}) to {latest_path}")
         
-        # Track best loss
-        if loss is not None and loss < self.best_loss:
-            self.best_loss = loss
-            self.best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
-            torch.save(checkpoint, self.best_checkpoint_path)
-            if is_main_process():
-                print(f"🏆 Saved best model (loss={loss:.6f}) to {self.best_checkpoint_path}")
-        
-        if is_best:
-            # Force save as best
+        # Save best checkpoint when loss improves
+        is_new_best = loss is not None and loss < self.best_loss
+        if is_new_best or is_best:
+            self.best_loss = loss if loss is not None else self.best_loss
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
             torch.save(checkpoint, best_path)
             if is_main_process():
-                print(f"Saved best model to {best_path}")
+                tag = "🏆 New best" if is_new_best else "Best"
+                print(f"{tag} model saved (loss={self.best_loss:.6f})")
     
     def generate_samples(self, epoch):
-        """Generate recovered digit samples using DDIM and log to W&B."""
-        import matplotlib.pyplot as plt
-        from PIL import Image
+        """Generate recovered digit samples via DDPM and log to W&B."""
         import io
-        import numpy as np
+        from sample_utils import generate_samples_ddpm, make_digit_grid
         
-        self.logger.info(f"Generating samples at epoch {epoch}...")
+        self.logger.info(f"Generating samples at epoch {epoch} (DDPM 1000 steps)...")
         self.model.eval()
         
-        # Generate 1 sample per class (0-9) using DDIM
+        # Generate 1 sample per class (0-9)
         class_labels = torch.arange(10, device=self.device)
-        
-        # Use DDIM for sampling
-        samples = self.diffusion.sample_ddim(
-            self.get_model(),
-            num_samples=10,
-            num_classes=10,
-            device=self.device,
-            num_steps=100,     # DDIM: 100 steps
-            eta=0.0,           # Deterministic sampling
-            class_labels=class_labels
-            # img_size will be auto-detected from model
+        phase_samples = generate_samples_ddpm(
+            self.get_model(), self.diffusion, self.device, class_labels
         )
         
-        # samples shape: (10, 1, 256, 256) for phase, values in [-1, 1]
-        # Convert to phase range [-π, π]
-        phase_samples = samples * np.pi  # Now in [-π, π]
-        
-        # Helper function: recover image from phase (FFT)
-        def recover_phase(phase_array):
-            """Recover digit from phase hologram using FFT."""
-            # Phase → complex wave front
-            u1 = np.exp(1j * phase_array)
-            
-            # FFT inverse transform
-            u2 = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(u1)))
-            
-            # Take magnitude
-            recovered = np.abs(u2)
-            
-            # Log + sqrt enhancement for contrast
-            recovered_log = np.log1p(recovered)
-            recovered_log = recovered_log / (np.max(recovered_log) + 1e-8)
-            recovered_enhanced = np.power(recovered_log, 0.5)
-            
-            # P95 clipping
-            p_high = np.percentile(recovered_enhanced, 95)
-            recovered_enhanced = np.clip(recovered_enhanced / p_high, 0, 1)
-            
-            return recovered_enhanced
-        
-        # Create figure with recovered digits
-        fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-        axes = axes.flatten()
-        
-        for digit_class in range(10):
-            phase = phase_samples[digit_class, 0].cpu().numpy()  # (256, 256)
-            recovered_digit = recover_phase(phase)
-            
-            axes[digit_class].imshow(recovered_digit, cmap='gray')
-            axes[digit_class].set_title(f'Digit {digit_class}')
-            axes[digit_class].axis('off')
-        
-        plt.suptitle(f'Epoch {epoch} - Recovered Digits (Num Steps=100)', fontsize=14, y=1.02)
-        plt.tight_layout()
+        # Render 2x5 grid
+        title = f'Epoch {epoch} — Recovered Digits (DDPM 1000 steps)'
+        fig = make_digit_grid(phase_samples, list(range(10)), title=title, ncols=5)
         
         # Save locally
         sample_path = os.path.join('outputs', f'recovered_digits_epoch_{epoch}.png')
         Path('outputs').mkdir(exist_ok=True)
-        plt.savefig(sample_path, dpi=100, bbox_inches='tight')
+        fig.savefig(sample_path, dpi=100, bbox_inches='tight')
         self.logger.info(f"Saved recovered digits to {sample_path}")
         
         # Log to W&B
         if self.use_wandb:
+            import matplotlib.pyplot as plt
             buf = io.BytesIO()
-            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
             buf.seek(0)
-            pil_image = Image.open(buf)
-            pil_image.load()  # Load to avoid BytesIO closure
-            
-            # Create a copy to keep in memory
-            pil_image_copy = pil_image.copy()
-            
+            from PIL import Image as PILImage
+            pil_image = PILImage.open(buf)
+            pil_image.load()
             wandb.log({
-                f"recovered_digits_epoch_{epoch}": wandb.Image(pil_image_copy),
+                f"recovered_digits_epoch_{epoch}": wandb.Image(pil_image.copy()),
                 "epoch": epoch,
             }, step=self.step)
             self.logger.info(f"Logged recovered digits to W&B for epoch {epoch}")
         
-        plt.close()
+        import matplotlib.pyplot as plt
+        plt.close(fig)
         self.model.train()
     
     def train(self, train_loader, sampler=None):
@@ -490,6 +520,16 @@ def main():
     if rank == 0:
         print(f"\nUsing device: {device}")
     
+    # Hyperparameters
+    num_epochs = 550
+    batch_size_per_gpu = 48 if is_distributed else 64  # A40 48G: 48×3=144, Single: 64
+    gradient_accumulation_steps = 1
+    learning_rate = 3e-5  # 0703验证稳定140epoch的峰值LR
+    warmup_epochs = 5     # Linear warmup for first 5 epochs (更平缓)
+    flat_epochs = 350     # 保持峰值LR不变的epoch数（warmup+flat共255 epochs）
+    timesteps = 1000
+    sample_interval = 20  # Generate recovered digits every 20 epochs
+    
     # Initialize W&B (only from rank 0)
     if rank == 0:
         print("\n📊 Initializing W&B...")
@@ -497,13 +537,16 @@ def main():
             project='minst',
             name='conditional_dit_phase_hologram_ddp' if is_distributed else 'conditional_dit_phase_hologram',
             config={
-                'num_epochs': 400,
-                'batch_size_per_gpu': 32 if is_distributed else 64,
+                'num_epochs': num_epochs,
+                'batch_size_per_gpu': batch_size_per_gpu,
                 'world_size': world_size,
-                'effective_batch_size': (32 if is_distributed else 64) * world_size,
-                'gradient_accumulation_steps': 1 if is_distributed else 2,
-                'learning_rate': 3e-5,
-                'timesteps': 1000,
+                'effective_batch_size': batch_size_per_gpu * world_size,
+                'gradient_accumulation_steps': gradient_accumulation_steps,
+                'learning_rate': learning_rate,
+                'warmup_epochs': warmup_epochs,
+                'flat_epochs': flat_epochs,
+                'decay_epochs': num_epochs - warmup_epochs - flat_epochs,
+                'timesteps': timesteps,
                 'model_type': 'ConditionalDiT',
                 'data_type': 'phase_hologram',
                 'img_size': 256,
@@ -514,14 +557,6 @@ def main():
             }
         )
         print("✅ W&B initialized")
-    
-    # Hyperparameters
-    num_epochs = 400
-    batch_size_per_gpu = 32 if is_distributed else 64  # DDP: 32×N=128+, Single: 64×2=128
-    gradient_accumulation_steps = 1 if is_distributed else 2
-    learning_rate = 3e-5
-    timesteps = 1000
-    sample_interval = 10  # Generate recovered digits every 10 epochs
     
     # Load phase hologram data (only from rank 0 to avoid disk contention)
     if rank == 0:
@@ -620,6 +655,9 @@ def main():
         log_interval=100,
         use_wandb=(rank == 0),  # Only rank 0 logs to W&B
         sample_interval=sample_interval,
+        warmup_epochs=warmup_epochs,
+        flat_epochs=flat_epochs,
+        num_batches_per_epoch=len(train_loader),
     )
     
     losses = trainer.train(train_loader, sampler=train_sampler)

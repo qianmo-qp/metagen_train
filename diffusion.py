@@ -283,16 +283,18 @@ class DiffusionSchedule:
         # Start from pure noise (adaptive to img_size)
         x_t = torch.randn(len(class_labels), 1, img_size, img_size, device=device)
         
-        # Create DDIM timesteps (more steps for better quality)
-        # Using stride to uniformly sample timesteps from 999 to 0
-        # Higher num_steps = higher quality but slower
-        stride = self.timesteps // num_steps  # Stride to skip timesteps
-        timesteps = torch.arange(self.timesteps - 1, -1, -stride, dtype=torch.long, device=device)
+        # Create DDIM timesteps using linspace for even spacing in noise level
+        # Avoids starting at t=999 where alpha_cumprod≈0 causes 64000x error amplification
+        # Schedule: evenly spaced from 0 to T-1, reversed, with -1 appended for final full denoise
+        ddim_timesteps = torch.linspace(0, self.timesteps - 1, num_steps, dtype=torch.long, device=device)
+        ddim_timesteps = torch.flip(ddim_timesteps, [0])  # Reverse: high t → low t
+        # Append -1 so the last step fully denoises (alpha_next=1.0)
+        ddim_timesteps = torch.cat([ddim_timesteps, torch.tensor([-1], dtype=torch.long, device=device)])
         
         # Reverse process with DDIM
-        for i in range(len(timesteps) - 1):
-            t_curr = timesteps[i].item()
-            t_next = timesteps[i + 1].item()
+        for i in range(len(ddim_timesteps) - 1):
+            t_curr = ddim_timesteps[i].item()
+            t_next = ddim_timesteps[i + 1].item()
             
             t_tensor = torch.full((len(class_labels),), t_curr, dtype=torch.long, device=device)
             t_next_tensor = torch.full((len(class_labels),), t_next, dtype=torch.long, device=device)
