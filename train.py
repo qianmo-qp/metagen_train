@@ -26,6 +26,7 @@ import wandb
 
 from dit_model import ConditionalDiT
 from diffusion import create_diffusion
+from config import TRAIN_CONFIGS
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,50 @@ def cleanup_distributed():
 def is_main_process():
     """Check if this is the main process (rank 0)."""
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+class EMAModel:
+    """
+    Exponential Moving Average of model weights.
+
+    Maintains a shadow copy updated as:
+        shadow = decay * shadow + (1 - decay) * param
+    Evaluation/sampling with EMA weights typically yields much cleaner
+    diffusion samples than the raw trained weights.
+    """
+
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        # Track both parameters and buffers (e.g. positional embeddings)
+        self.shadow = {k: v.detach().clone()
+                       for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(
+                    v.detach(), alpha=1.0 - self.decay)
+            else:
+                self.shadow[k].copy_(v)
+
+    def apply(self, model):
+        """Swap EMA weights into model; return previous weights for restore."""
+        backup = {k: v.detach().clone()
+                  for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+        return backup
+
+    @staticmethod
+    def restore(model, backup):
+        model.load_state_dict(backup, strict=True)
+
+    def state_dict(self):
+        return {'decay': self.decay, 'shadow': self.shadow}
+
+    def load_state_dict(self, state):
+        self.decay = state['decay']
+        self.shadow = state['shadow']
 
 
 def load_phase_data(data_dir='data/minst_phase'):
@@ -174,8 +219,8 @@ def normalize_phase_data(phase_data):
     """
     Normalize phase data to [-1, 1] range.
     
-    输入: phase_data, shape: (..., 256, 256), range: [-π, π]
-    输出: normalized, shape: (..., 1, 256, 256), range: [-1, 1]
+    输入: phase_data, shape: (..., H, W), range: [-π, π]（H/W 由配置 img_size 决定）
+    输出: normalized, shape: (..., 1, H, W), range: [-1, 1]
     """
     # 相位范围: [-π, π] → [-1, 1]
     phase_norm = phase_data / np.pi
@@ -201,6 +246,12 @@ class Trainer:
         warmup_epochs=3,
         flat_epochs=97,
         num_batches_per_epoch=938,
+        weight_decay=0.01,
+        grad_clip_max_norm=1.0,
+        nan_loss_threshold=5,
+        nan_grad_threshold=20,
+        nan_recovery_lr_factor=0.7,
+        ema_decay=0.9999,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -213,12 +264,21 @@ class Trainer:
         self.sample_interval = sample_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.grad_clip_max_norm = grad_clip_max_norm
+        self.nan_loss_threshold = nan_loss_threshold
+        self.nan_grad_threshold = nan_grad_threshold
+        self.nan_recovery_lr_factor = nan_recovery_lr_factor
         
         # Check if model is wrapped in DDP
         self.is_ddp = isinstance(model, DDP)
         
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.loss_fn = nn.MSELoss()
+        
+        # EMA of model weights (for cleaner sampling/evaluation)
+        self.ema_decay = ema_decay
+        self.ema = EMAModel(self.get_model(), decay=ema_decay) if ema_decay > 0 else None
         
         # Create checkpoint directory
         Path(self.checkpoint_dir).mkdir(exist_ok=True)
@@ -296,7 +356,7 @@ class Trainer:
                 if is_main_process():
                     print(f"⚠️  NaN/Inf loss detected at step {self.step}, batch {batch_idx + 1} (count: {self.nan_count})")
                 self.optimizer.zero_grad()  # Clear any accumulated gradients
-                if self.nan_count >= 5:
+                if self.nan_count >= self.nan_loss_threshold:
                     if is_main_process():
                         print(f"🛑 {self.nan_count} consecutive NaN losses! Halving LR and loading best checkpoint...")
                     self._recover_from_nan()
@@ -310,7 +370,7 @@ class Trainer:
             # Gradient clipping & optimizer step every N steps
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 # Check gradient norm before stepping
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_max_norm)
                 
                 # Skip update if gradient is NaN/Inf
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -320,7 +380,7 @@ class Trainer:
                     self.optimizer.zero_grad()
                     
                     # Trigger recovery on consecutive NaN gradients
-                    if self.nan_grad_count >= 20:
+                    if self.nan_grad_count >= self.nan_grad_threshold:
                         if is_main_process():
                             print(f"🛑 {self.nan_grad_count} consecutive NaN gradients! Loading best checkpoint and halving LR...")
                         self._recover_from_nan()
@@ -328,13 +388,15 @@ class Trainer:
                     self.nan_grad_count = 0  # Reset gradient NaN counter on valid grad
                     self.optimizer.step()
                     self.scheduler.step()  # Update LR after each valid step
+                    if self.ema is not None:
+                        self.ema.update(self.get_model())
             
             epoch_loss += unscaled_loss
             valid_batches += 1
             self.losses.append(unscaled_loss)
             self.step += 1
             
-            if (batch_idx + 1) % self.log_interval == 0:
+            if self.step % self.log_interval == 0:
                 avg_loss = epoch_loss / max(valid_batches, 1)
                 current_lr = self.optimizer.param_groups[0]['lr']
                 # Only print from rank 0
@@ -360,10 +422,16 @@ class Trainer:
         if os.path.exists(best_path):
             checkpoint = torch.load(best_path, map_location=self.device)
             self.get_model().load_state_dict(checkpoint['model_state_dict'])
+            # Sync EMA with the restored weights
+            if self.ema is not None:
+                if checkpoint.get('ema_state_dict') is not None:
+                    self.ema.load_state_dict(checkpoint['ema_state_dict'])
+                else:
+                    self.ema = EMAModel(self.get_model(), decay=self.ema_decay)
         # Reduce LR by 30% (not halve — avoid LR collapsing too fast)
-        self.scheduler.base_lrs = [lr * 0.7 for lr in self.scheduler.base_lrs]
+        self.scheduler.base_lrs = [lr * self.nan_recovery_lr_factor for lr in self.scheduler.base_lrs]
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = param_group['lr'] * 0.7
+            param_group['lr'] = param_group['lr'] * self.nan_recovery_lr_factor
         if is_main_process():
             if os.path.exists(best_path):
                 print(f"✅ Restored from best checkpoint (epoch {checkpoint.get('epoch', '?')}, loss={checkpoint.get('loss', '?')})")
@@ -379,6 +447,7 @@ class Trainer:
             'model_state_dict': self.get_model().state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if hasattr(self, 'scheduler') else None,
+            'ema_state_dict': self.ema.state_dict() if self.ema is not None else None,
             'losses': self.losses,
             'loss': loss,
         }
@@ -407,11 +476,20 @@ class Trainer:
         self.logger.info(f"Generating samples at epoch {epoch} (DDPM 1000 steps)...")
         self.model.eval()
         
+        # Use EMA weights for sampling (cleaner results); restore afterwards
+        ema_backup = None
+        if self.ema is not None:
+            ema_backup = self.ema.apply(self.get_model())
+        
         # Generate 1 sample per class (0-9)
         class_labels = torch.arange(10, device=self.device)
         phase_samples = generate_samples_ddpm(
             self.get_model(), self.diffusion, self.device, class_labels
         )
+        
+        # Restore raw training weights
+        if ema_backup is not None:
+            EMAModel.restore(self.get_model(), ema_backup)
         
         # Render 2x5 grid
         title = f'Epoch {epoch} — Recovered Digits (DDPM 1000 steps)'
@@ -486,6 +564,18 @@ class Trainer:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Conditional DiT Training')
+    parser.add_argument('--config', type=str, default='4_GPU_256x256',
+                        choices=list(TRAIN_CONFIGS.keys()),
+                        help='Training config preset name')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from (model weights only)')
+    args = parser.parse_args()
+    
+    cfg = TRAIN_CONFIGS[args.config]
+    model_cfg = cfg['model']
+    
     # Reduce CUDA memory fragmentation for large models
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
@@ -520,48 +610,57 @@ def main():
     if rank == 0:
         print(f"\nUsing device: {device}")
     
-    # Hyperparameters
-    num_epochs = 550
-    batch_size_per_gpu = 48 if is_distributed else 64  # A40 48G: 48×3=144, Single: 64
-    gradient_accumulation_steps = 1
-    learning_rate = 3e-5  # 0703验证稳定140epoch的峰值LR
-    warmup_epochs = 5     # Linear warmup for first 5 epochs (更平缓)
-    flat_epochs = 350     # 保持峰值LR不变的epoch数（warmup+flat共255 epochs）
-    timesteps = 1000
-    sample_interval = 20  # Generate recovered digits every 20 epochs
+    # Hyperparameters (from config)
+    num_epochs = cfg['num_epochs']
+    batch_size_per_gpu = cfg['batch_size_per_gpu']
+    gradient_accumulation_steps = cfg['gradient_accumulation_steps']
+    learning_rate = cfg['learning_rate']
+    warmup_epochs = cfg['warmup_epochs']
+    flat_epochs = cfg['flat_epochs']
+    timesteps = cfg['timesteps']
+    sample_interval = cfg['sample_interval']
+    weight_decay = cfg['weight_decay']
+    grad_clip_max_norm = cfg['grad_clip_max_norm']
+    nan_loss_threshold = cfg['nan_loss_threshold']
+    nan_grad_threshold = cfg['nan_grad_threshold']
+    nan_recovery_lr_factor = cfg['nan_recovery_lr_factor']
+    ema_decay = cfg.get('ema_decay', 0.9999)  # EMA of model weights (0 to disable)
     
     # Initialize W&B (only from rank 0)
     if rank == 0:
+        print(f"\n📊 Config: {args.config}")
         print("\n📊 Initializing W&B...")
         wandb.init(
-            project='minst',
-            name='conditional_dit_phase_hologram_ddp' if is_distributed else 'conditional_dit_phase_hologram',
+            project=cfg['wandb_project'],
+            name=cfg['wandb_name_ddp'] if is_distributed else cfg['wandb_name_single'],
             config={
+                'config_name': args.config,
                 'num_epochs': num_epochs,
                 'batch_size_per_gpu': batch_size_per_gpu,
                 'world_size': world_size,
-                'effective_batch_size': batch_size_per_gpu * world_size,
+                'effective_batch_size': batch_size_per_gpu * world_size * gradient_accumulation_steps,
                 'gradient_accumulation_steps': gradient_accumulation_steps,
                 'learning_rate': learning_rate,
+                'weight_decay': weight_decay,
+                'grad_clip_max_norm': grad_clip_max_norm,
+                'ema_decay': ema_decay,
                 'warmup_epochs': warmup_epochs,
                 'flat_epochs': flat_epochs,
                 'decay_epochs': num_epochs - warmup_epochs - flat_epochs,
                 'timesteps': timesteps,
                 'model_type': 'ConditionalDiT',
                 'data_type': 'phase_hologram',
-                'img_size': 256,
-                'patch_size': 8,
-                'hidden_dim': 768,
-                'num_layers': 12,
-                'num_heads': 12,
+                'data_dir': cfg.get('data_dir', 'data/minst_phase'),
+                **{f'model_{k}': v for k, v in model_cfg.items()},
             }
         )
         print("✅ W&B initialized")
     
-    # Load phase hologram data (only from rank 0 to avoid disk contention)
+    # Load phase hologram data (data_dir from config, fallback to default)
+    data_dir = cfg.get('data_dir', 'data/minst_phase')
     if rank == 0:
-        print("Loading phase hologram data...")
-    train_phase, train_labels, test_phase, test_labels = load_phase_data('data/minst_phase')
+        print(f"Loading phase hologram data from: {data_dir}")
+    train_phase, train_labels, test_phase, test_labels = load_phase_data(data_dir)
     if rank == 0:
         print(f"✅ Phase data loaded successfully!")
     
@@ -613,23 +712,13 @@ def main():
     # Create model and diffusion
     if rank == 0:
         print("Creating model...")
-    model = ConditionalDiT(
-        img_size=256,
-        patch_size=8,
-        in_channels=1,
-        hidden_dim=768,
-        num_heads=12,
-        num_layers=12,
-        time_dim=256,
-        num_classes=10,
-        mlp_ratio=4,
-    )
+    model = ConditionalDiT(**model_cfg)
     
     num_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f"Model parameters: {num_params:,}")
     
-    diffusion = create_diffusion(timesteps=timesteps, schedule_type='cosine')
+    diffusion = create_diffusion(timesteps=timesteps, schedule_type=cfg['schedule_type'])
     
     # Move diffusion buffers to device
     for attr_name in dir(diffusion):
@@ -652,12 +741,18 @@ def main():
         num_epochs=num_epochs,
         batch_size=batch_size_per_gpu,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        log_interval=100,
-        use_wandb=(rank == 0),  # Only rank 0 logs to W&B
+        log_interval=cfg['log_interval'],
+        use_wandb=(rank == 0),
         sample_interval=sample_interval,
         warmup_epochs=warmup_epochs,
         flat_epochs=flat_epochs,
         num_batches_per_epoch=len(train_loader),
+        weight_decay=weight_decay,
+        grad_clip_max_norm=grad_clip_max_norm,
+        nan_loss_threshold=nan_loss_threshold,
+        nan_grad_threshold=nan_grad_threshold,
+        nan_recovery_lr_factor=nan_recovery_lr_factor,
+        ema_decay=ema_decay,
     )
     
     losses = trainer.train(train_loader, sampler=train_sampler)

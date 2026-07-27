@@ -42,6 +42,18 @@ def main():
     parser.add_argument('--digits', nargs='+', type=int, default=list(range(1, 10)),
                         help='Digits to generate (default: 1-9)')
     parser.add_argument('--output-dir', default='outputs', help='Output directory')
+    parser.add_argument('--resolution', type=int, default=28,
+                        help='Display resolution for recovered digits (default: 28)')
+    parser.add_argument('--denoise', type=int, default=3,
+                        help='Median filter kernel size for noise removal (0=off, 3 or 5 recommended, default: 3)')
+    parser.add_argument('--contrast', type=float, default=1.5,
+                        help='Post-processing contrast enhancement (default: 1.5)')
+    parser.add_argument('--gamma', type=float, default=0.7,
+                        help='Post-processing gamma correction, <1 brightens digits (default: 0.7)')
+    parser.add_argument('--sharpen', type=float, default=1.0,
+                        help='Post-processing sharpen strength, 0 disables (default: 1.0)')
+    parser.add_argument('--no-enhance', action='store_true',
+                        help='Disable all post-processing (denoise/contrast/gamma/sharpen)')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -75,12 +87,23 @@ def main():
     print("🔬 Recovering digits from phase holograms...")
     ncols = 3 if len(args.digits) <= 9 else 5
     title = f'Epoch {epoch} — Recovered Digits (DDPM 1000 steps)'
-    fig = make_digit_grid(phase_samples, args.digits, title=title, ncols=ncols)
+
+    # Default mild enhancement unless disabled
+    denoise = 0 if args.no_enhance else args.denoise
+    contrast = 1.0 if args.no_enhance else args.contrast
+    gamma = 1.0 if args.no_enhance else args.gamma
+    sharpen = 0.0 if args.no_enhance else args.sharpen
+
+    fig = make_digit_grid(
+        phase_samples, args.digits, title=title, ncols=ncols,
+        resolution=args.resolution, denoise=denoise,
+        contrast=contrast, gamma=gamma, sharpen=sharpen, black_point=0.05
+    )
 
     # Save with descriptive filename
     epoch_match = re.search(r'epoch_(\d+)', args.checkpoint)
     epoch_str = epoch_match.group(1) if epoch_match else str(epoch)
-    output_filename = f'recovered_digits_ddpm_1000_{epoch_str}.png'
+    output_filename = f'recovered_digits_epoch_{epoch_str}.png'
     output_path = os.path.join(args.output_dir, output_filename)
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

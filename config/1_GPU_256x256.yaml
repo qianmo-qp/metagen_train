@@ -1,0 +1,54 @@
+# 0703 基线配置 (1× A40, 单卡)
+# 记录用于参考和对比
+# ⚠️ 本配置针对 256×256 相位数据设计
+
+num_epochs: 400
+
+# 数据路径（相位 NPZ 数据根目录，含 train/ 与 test/ 子目录）
+data_dir: data/minst_phase
+
+# 数据并行
+batch_size_per_gpu: 64
+gradient_accumulation_steps: 2  # effective batch = 128
+
+# 学习率
+learning_rate: 3.0e-5
+warmup_epochs: 0                # 无 warmup
+flat_epochs: 0                  # 无 flat 阶段
+# 0703 使用 CosineAnnealingLR(T_max=400000, eta_min=1e-7)
+# LR 几乎恒定在 3e-5 ~ 2.4e-5
+
+# 扩散
+timesteps: 1000
+schedule_type: cosine
+
+# 采样
+sample_interval: 20
+
+# 优化器
+weight_decay: 0.01
+grad_clip_max_norm: 1.0
+
+# NaN 恢复 (0703 无此机制，此处为占位)
+nan_loss_threshold: 5
+nan_grad_threshold: 20
+nan_recovery_lr_factor: 0.7
+
+# 日志
+log_interval: 100
+
+# 模型架构 (ConditionalDiT-B, 输入 256×256)
+model:
+  img_size: 256
+  patch_size: 8
+  in_channels: 1
+  hidden_dim: 768
+  num_heads: 12
+  num_layers: 12
+  time_dim: 256
+  num_classes: 10
+  mlp_ratio: 4
+
+# W&B
+wandb_project: minst
+wandb_name_single: conditional_dit_phase_hologram

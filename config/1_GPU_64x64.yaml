@@ -1,0 +1,54 @@
+# 1× A40 单卡 Training — 64×64 相位数据
+# 基于 1_GPU_256x256 调整：分辨率 256→64，数据指向 minst_phase_64
+# ⚠️ 本配置针对 64×64 相位数据设计（data/minst_phase_64）
+
+num_epochs: 400
+
+# 数据路径（相位 NPZ 数据根目录，含 train/ 与 test/ 子目录）
+data_dir: data/minst_phase_64
+
+# 数据并行
+# 64×64 序列长度仅 64 token，显存占用远小于 256，batch 可显著调大。如 OOM 请下调。
+batch_size_per_gpu: 128
+gradient_accumulation_steps: 2  # effective batch = 256
+
+# 学习率
+learning_rate: 3.0e-5
+warmup_epochs: 0                # 无 warmup（对齐 0703 单卡基线）
+flat_epochs: 0                  # 无 flat 阶段
+
+# 扩散
+timesteps: 1000
+schedule_type: cosine
+
+# 采样
+sample_interval: 20
+
+# 优化器
+weight_decay: 0.01
+grad_clip_max_norm: 1.0
+
+# NaN 恢复
+nan_loss_threshold: 5
+nan_grad_threshold: 20
+nan_recovery_lr_factor: 0.7
+
+# 日志（64×64 每 epoch step 较少，调小间隔以保证每 epoch 多个记录点）
+log_interval: 25
+
+# 模型架构 (ConditionalDiT-B, 输入 64×64)
+# img_size=64, patch_size=4 → 16×16=256 个 patch token（更细粒度）
+model:
+  img_size: 64
+  patch_size: 4
+  in_channels: 1
+  hidden_dim: 768
+  num_heads: 12
+  num_layers: 12
+  time_dim: 256
+  num_classes: 10
+  mlp_ratio: 4
+
+# W&B
+wandb_project: minst
+wandb_name_single: conditional_dit_phase_hologram_64

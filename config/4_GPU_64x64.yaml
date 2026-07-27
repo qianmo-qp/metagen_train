@@ -1,0 +1,60 @@
+# 4× A40 40GB DDP Training — 64×64 相位数据
+# 基于 4_GPU_256x256 调整：分辨率 256→64，数据指向 minst_phase_64
+# ⚠️ 本配置针对 64×64 相位数据设计（data/minst_phase_64）
+
+num_epochs: 700
+
+# 数据路径（相位 NPZ 数据根目录，含 train/ 与 test/ 子目录）
+data_dir: data/minst_phase_64
+
+# 数据并行
+# 64×64 序列长度仅 256 token（patch_size=4）。之前 effective batch 768 偏大，
+# 梯度噪声不足导致收敛地板高；调小到 256 以增加噪声、助逃出平台。
+batch_size_per_gpu: 64          # 64×4=256 effective
+gradient_accumulation_steps: 1
+
+# 学习率
+learning_rate: 5.0e-5           # 8e-5 曾触发 NaN 恢复；5e-5 更稳定
+warmup_epochs: 10               # Linear warmup（拉长以平滑起步）
+flat_epochs: 200                # 保持峰值 LR 不变
+# Cosine decay 自动计算: num_epochs - warmup - flat = 490
+
+# EMA（权重指数滑动平均，采样/评估用 EMA 权重，显著改善生成质量）
+ema_decay: 0.9999
+
+# 扩散
+timesteps: 1000
+schedule_type: cosine
+
+# 采样
+sample_interval: 20             # 每 N 个 epoch 采样一次
+
+# 优化器
+weight_decay: 0.01
+grad_clip_max_norm: 1.0
+
+# NaN 恢复
+nan_loss_threshold: 5           # 连续 NaN loss 次数触发恢复
+nan_grad_threshold: 20          # 连续 NaN gradient norm 次数触发恢复
+nan_recovery_lr_factor: 0.7     # 恢复时 LR 乘以该因子
+
+# 日志（64×64 每 epoch 仅 ~78 step，调小间隔以保证每 epoch 多个记录点）
+log_interval: 25
+
+# 模型架构 (ConditionalDiT-B, 输入 64×64)
+# img_size=64, patch_size=4 → 16×16=256 个 patch token（更细粒度）
+model:
+  img_size: 64
+  patch_size: 4
+  in_channels: 1
+  hidden_dim: 768
+  num_heads: 12
+  num_layers: 12
+  time_dim: 256
+  num_classes: 10
+  mlp_ratio: 4
+
+# W&B
+wandb_project: minst
+wandb_name_ddp: conditional_dit_phase_hologram_64_ddp
+wandb_name_single: conditional_dit_phase_hologram_64
