@@ -37,6 +37,26 @@ MANIFEST
 checkpoints/
 outputs/
 
+# 最优结果归档：模型权重/日志太大不入库，README 与推理图入库
+best_run/*
+!best_run/*/
+!best_run/*/README.md
+!best_run/*/*.png
+!best_run/*/samples/
+!best_run/*/samples/*.png
+best_run/**/*.pt
+best_run/*/wandb_run/
+best_run/*/*.log
+
 # Logs
 *.log
 runs/
+
+# 大型数据（不入库）
+data/minst_phase/
+data/minst_phase_64/
+wandb/
+matplotlib-*/
+
+# 临时诊断
+ds/temp_resolution_comparison*/

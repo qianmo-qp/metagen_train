@@ -157,6 +157,56 @@ class DiffusionSchedule:
         return mean + nonzero_mask * torch.sqrt(variance).view(-1, 1, 1, 1) * noise
     
     @torch.no_grad()
+    def p_sample_guided(self, model, x_t, t, c, target_amp,
+                        guidance_scale=0.4, clip_denoised=True):
+        """
+        Reverse diffusion step with GS-projection guidance (inference only).
+
+        After predicting x̂₀, apply one GS measurement projection toward the
+        target far-field amplitude, then blend on the unit circle with
+        λ_t = guidance_scale · √ᾱ_t (weak at high noise, strong near t=0).
+        Gradient-free: costs ~2 extra FFTs per step, no backprop through model.
+
+        Args:
+            model:          Denoising model
+            x_t:            Noisy image at timestep t
+            t:              Timestep tensor (B,)
+            c:              Class conditioning
+            target_amp:     (B, 1, H, W) target far-field amplitude
+            guidance_scale: λ_max in [0, 1]; 0 = plain DDPM step
+        Returns:
+            x_{t-1}: Denoised image
+        """
+        from sample_utils import gs_project_phase  # lazy import, avoids cycle
+
+        predicted_noise = model(x_t, t, c)
+
+        # x_0 from predicted noise (same as p_mean_variance)
+        x_0_pred = (x_t - torch.sqrt(1.0 - self.alphas_cumprod[t]).view(-1, 1, 1, 1) * predicted_noise) / \
+                   torch.sqrt(self.alphas_cumprod[t]).view(-1, 1, 1, 1)
+        if clip_denoised:
+            x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
+
+        # GS projection + unit-circle blending (handles ±π wraparound)
+        if guidance_scale > 0:
+            lam = (guidance_scale * self.sqrt_alphas_cumprod[t]).view(-1, 1, 1, 1)
+            phase = x_0_pred * math.pi
+            phase_proj = gs_project_phase(phase, target_amp)
+            z = (1.0 - lam) * torch.exp(1j * phase) + lam * torch.exp(1j * phase_proj)
+            x_0_pred = torch.angle(z) / math.pi
+
+        # Posterior mean/variance from (possibly projected) x_0
+        coef1 = self.posterior_mean_coef1[t].view(-1, 1, 1, 1)
+        coef2 = self.posterior_mean_coef2[t].view(-1, 1, 1, 1)
+        mean = coef1 * x_0_pred + coef2 * x_t
+        variance = self.posterior_variance[t].view(-1, 1, 1, 1)
+
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, 1, 1, 1)
+
+        return mean + nonzero_mask * torch.sqrt(variance) * noise
+    
+    @torch.no_grad()
     def p_sample_ddim(self, model, x_t, t, t_next, c, eta=0.0, clip_denoised=True):
         """
         DDIM reverse step (deterministic or stochastic based on eta).

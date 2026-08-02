@@ -16,6 +16,7 @@ import numpy as np
 from pathlib import Path
 import subprocess
 import logging
+from datetime import datetime
 
 # Disable torch._dynamo to avoid ONNX import issues
 os.environ['TORCH_DISABLE_DYNANMO'] = '1'
@@ -239,6 +240,7 @@ class Trainer:
         num_epochs=10,
         batch_size=128,
         checkpoint_dir='checkpoints',
+        output_dir='outputs',
         log_interval=100,
         gradient_accumulation_steps=4,
         use_wandb=False,
@@ -252,6 +254,7 @@ class Trainer:
         nan_grad_threshold=20,
         nan_recovery_lr_factor=0.7,
         ema_decay=0.9999,
+        start_epoch=0,
     ):
         self.model = model.to(device)
         self.diffusion = diffusion
@@ -259,6 +262,7 @@ class Trainer:
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.checkpoint_dir = checkpoint_dir
+        self.output_dir = output_dir
         self.log_interval = log_interval
         self.use_wandb = use_wandb
         self.sample_interval = sample_interval
@@ -280,10 +284,12 @@ class Trainer:
         self.ema_decay = ema_decay
         self.ema = EMAModel(self.get_model(), decay=ema_decay) if ema_decay > 0 else None
         
-        # Create checkpoint directory
-        Path(self.checkpoint_dir).mkdir(exist_ok=True)
+        # Create checkpoint & output directories (run-specific, may be nested)
+        Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         
         self.step = 0
+        self.start_epoch = start_epoch  # >0 when resumed: continue from this epoch
         self.losses = []
         self.logger = logging.getLogger(__name__)
         self.best_loss = float('inf')
@@ -292,9 +298,12 @@ class Trainer:
         self.nan_grad_count = 0  # Track consecutive NaN gradient norm occurrences
         
         # LR Scheduler: Linear warmup + Flat + Cosine decay
-        # Calculate actual optimizer steps
-        steps_per_epoch = num_batches_per_epoch // gradient_accumulation_steps
-        self.total_steps = num_epochs * steps_per_epoch
+        # Calculate actual optimizer steps. When resumed (start_epoch>0), the schedule
+        # spans only the REMAINING epochs and uses a fresh (smaller) fine-tune peak LR.
+        self.steps_per_epoch = num_batches_per_epoch // gradient_accumulation_steps
+        steps_per_epoch = self.steps_per_epoch
+        schedule_epochs = num_epochs - start_epoch
+        self.total_steps = schedule_epochs * steps_per_epoch
         self.warmup_steps = warmup_epochs * steps_per_epoch
         self.flat_steps = flat_epochs * steps_per_epoch
         self.decay_start = self.warmup_steps + self.flat_steps  # Cosine decay starts here
@@ -316,15 +325,49 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         
         if is_main_process():
+            if start_epoch > 0:
+                print(f"🔁 Fine-tune schedule over remaining {schedule_epochs} epochs "
+                      f"(resume from epoch {start_epoch}, peak LR {learning_rate:.1e}):")
             print(f"LR Schedule: warmup {warmup_epochs} epochs ({self.warmup_steps} steps) "
                   f"+ flat {flat_epochs} epochs ({self.flat_steps} steps) "
-                  f"+ cosine decay {num_epochs - warmup_epochs - flat_epochs} epochs")
+                  f"+ cosine decay {schedule_epochs - warmup_epochs - flat_epochs} epochs")
             print(f"  Peak LR: {learning_rate}, Min LR: 1e-6")
             print(f"  Total optimizer steps: {self.total_steps}")
     
     def get_model(self):
         """Get the underlying model (unwrap DDP if needed)."""
         return self.model.module if self.is_ddp else self.model
+    
+    def load_checkpoint(self, path):
+        """Load model/optimizer/EMA weights and progress from a checkpoint for resume.
+
+        The LR scheduler is intentionally NOT restored: a fresh fine-tune schedule
+        (new peak LR over the remaining epochs) is used instead — continuing at the
+        old schedule's 1e-6 floor would barely move the loss.
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        self.get_model().load_state_dict(checkpoint['model_state_dict'])
+        if checkpoint.get('optimizer_state_dict') is not None:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                if is_main_process():
+                    print(f"⚠️  Could not restore optimizer state ({e}); using fresh optimizer")
+        if self.ema is not None:
+            if checkpoint.get('ema_state_dict') is not None:
+                self.ema.load_state_dict(checkpoint['ema_state_dict'])
+            else:
+                self.ema = EMAModel(self.get_model(), decay=self.ema_decay)
+        self.start_epoch = int(checkpoint.get('epoch', 0))
+        self.step = int(checkpoint.get('step', 0))
+        self.losses = checkpoint.get('losses', []) or []
+        if checkpoint.get('loss') is not None:
+            self.best_loss = float(checkpoint['loss'])
+        if is_main_process():
+            print(f"✅ Resumed from {path}")
+            print(f"   epoch={self.start_epoch}, global step={self.step}, "
+                  f"best_loss={self.best_loss:.6f}")
+        return checkpoint
     
     def train_epoch(self, train_loader):
         """Train for one epoch with NaN detection and gradient monitoring."""
@@ -496,8 +539,8 @@ class Trainer:
         fig = make_digit_grid(phase_samples, list(range(10)), title=title, ncols=5)
         
         # Save locally
-        sample_path = os.path.join('outputs', f'recovered_digits_epoch_{epoch}.png')
-        Path('outputs').mkdir(exist_ok=True)
+        sample_path = os.path.join(self.output_dir, f'recovered_digits_epoch_{epoch}.png')
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         fig.savefig(sample_path, dpi=100, bbox_inches='tight')
         self.logger.info(f"Saved recovered digits to {sample_path}")
         
@@ -511,7 +554,7 @@ class Trainer:
             pil_image = PILImage.open(buf)
             pil_image.load()
             wandb.log({
-                f"recovered_digits_epoch_{epoch}": wandb.Image(pil_image.copy()),
+                "recovered_digits": wandb.Image(pil_image.copy()),
                 "epoch": epoch,
             }, step=self.step)
             self.logger.info(f"Logged recovered digits to W&B for epoch {epoch}")
@@ -525,8 +568,11 @@ class Trainer:
         if is_main_process():
             print(f"Training on {self.device}")
             print(f"Total epochs: {self.num_epochs}")
+            if self.start_epoch > 0:
+                print(f"🔁 Resuming: training epochs {self.start_epoch + 1}→{self.num_epochs} "
+                      f"({self.num_epochs - self.start_epoch} remaining)")
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(self.start_epoch, self.num_epochs):
             # Set epoch for DDP sampler (important for shuffling)
             if sampler is not None and hasattr(sampler, 'set_epoch'):
                 sampler.set_epoch(epoch)
@@ -556,7 +602,7 @@ class Trainer:
                 wandb.log({
                     "epoch_loss": avg_loss,
                     "epoch": epoch + 1,
-                })
+                }, step=self.step)
         
         if is_main_process():
             print("\nTraining complete!")
@@ -570,7 +616,8 @@ def main():
                         choices=list(TRAIN_CONFIGS.keys()),
                         help='Training config preset name')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from (model weights only)')
+                        help='Checkpoint path to resume from: loads model/optimizer/EMA weights '
+                             'and continues with a fresh fine-tune LR schedule (peak = resume_lr)')
     args = parser.parse_args()
     
     cfg = TRAIN_CONFIGS[args.config]
@@ -610,6 +657,20 @@ def main():
     if rank == 0:
         print(f"\nUsing device: {device}")
     
+    # Per-run output directories: checkpoints/<config>_<date> and outputs/<config>_<date>
+    # Compute on rank 0 and broadcast so all ranks agree on the same timestamp.
+    run_name = f"{args.config}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if is_distributed:
+        obj = [run_name]
+        dist.broadcast_object_list(obj, src=0)
+        run_name = obj[0]
+    checkpoint_dir = os.path.join('checkpoints', run_name)
+    output_dir = os.path.join('outputs', run_name)
+    if rank == 0:
+        print(f"📁 Run: {run_name}")
+        print(f"   checkpoints → {checkpoint_dir}")
+        print(f"   outputs     → {output_dir}")
+    
     # Hyperparameters (from config)
     num_epochs = cfg['num_epochs']
     batch_size_per_gpu = cfg['batch_size_per_gpu']
@@ -625,6 +686,7 @@ def main():
     nan_grad_threshold = cfg['nan_grad_threshold']
     nan_recovery_lr_factor = cfg['nan_recovery_lr_factor']
     ema_decay = cfg.get('ema_decay', 0.9999)  # EMA of model weights (0 to disable)
+    resume_lr = cfg.get('resume_lr', 1e-5)    # smaller peak LR used when --resume fine-tuning
     
     # Initialize W&B (only from rank 0)
     if rank == 0:
@@ -720,6 +782,21 @@ def main():
     
     diffusion = create_diffusion(timesteps=timesteps, schedule_type=cfg['schedule_type'])
     
+    # Resume: read the checkpoint epoch so the LR schedule spans only the remaining
+    # epochs and the fine-tune peak LR (resume_lr) replaces the from-scratch peak.
+    start_epoch = 0
+    if args.resume:
+        _ckpt = torch.load(args.resume, map_location='cpu')
+        start_epoch = int(_ckpt.get('epoch', 0))
+        del _ckpt
+        if start_epoch >= num_epochs:
+            raise ValueError(
+                f"Checkpoint is already at epoch {start_epoch} but num_epochs={num_epochs}. "
+                f"Increase num_epochs in {args.config}.yaml to continue fine-tuning.")
+        learning_rate = resume_lr
+        if rank == 0:
+            print(f"🔁 Resume mode: continue from epoch {start_epoch} with fine-tune peak LR {resume_lr:.1e}")
+    
     # Move diffusion buffers to device
     for attr_name in dir(diffusion):
         attr = getattr(diffusion, attr_name)
@@ -740,6 +817,8 @@ def main():
         learning_rate=learning_rate,
         num_epochs=num_epochs,
         batch_size=batch_size_per_gpu,
+        checkpoint_dir=checkpoint_dir,
+        output_dir=output_dir,
         gradient_accumulation_steps=gradient_accumulation_steps,
         log_interval=cfg['log_interval'],
         use_wandb=(rank == 0),
@@ -753,7 +832,12 @@ def main():
         nan_grad_threshold=nan_grad_threshold,
         nan_recovery_lr_factor=nan_recovery_lr_factor,
         ema_decay=ema_decay,
+        start_epoch=start_epoch,
     )
+    
+    # Load checkpoint weights AFTER the Trainer (optimizer/EMA) is built
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
     
     losses = trainer.train(train_loader, sampler=train_sampler)
     

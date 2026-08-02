@@ -12,16 +12,43 @@ import argparse
 class PhaseExtractor:
     """从图像提取相位全息图"""
     
-    def __init__(self, resolution=256, iterations=200, verbose=True):
+    def __init__(self, resolution=256, iterations=200, verbose=True, smoothness=0.0):
         """
         参数:
             resolution: 处理分辨率 (推荐256)
             iterations: GS迭代次数
             verbose: 是否打印进度
+            smoothness: 相位平滑约束强度 [0, 1]。0=关闭（原始 GS，相位高熵近白噪声）；
+                        推荐 0.3~0.6。越大相位越平滑（空间熵越低，越利于扩散模型学习），
+                        但重建振幅保真度会下降。
         """
         self.N = resolution
         self.iterations = iterations
         self.verbose = verbose
+        self.smoothness = float(smoothness)
+        self._smooth_kernel = None
+        if self.smoothness > 0:
+            # 高斯核标准差随分辨率缩放（以 64 为基准，×2 使约束更有效）
+            sigma = max(0.8, 2.0 * self.N / 64.0)
+            self._smooth_kernel = self._make_circular_gaussian_kernel(sigma)
+    
+    def _make_circular_gaussian_kernel(self, sigma):
+        """构造 N×N 循环高斯平滑核（频域相乘，支持相位环绕边界）。"""
+        N = self.N
+        ax = np.arange(N)
+        # 循环距离坐标
+        dx = np.minimum(ax, N - ax)
+        g1 = np.exp(-(dx ** 2) / (2.0 * sigma ** 2))
+        kernel = np.outer(g1, g1)
+        kernel /= kernel.sum()
+        # 预计算 FFT；fftshift 使核原点居中以便与相位直接相乘
+        return np.fft.fft2(np.fft.ifftshift(kernel))
+    
+    def _smooth_phase(self, phase):
+        """对相位做循环高斯平滑（处理 ±π 环绕），返回平滑后相位 [-π, π]。"""
+        z = np.exp(1j * phase)  # 映射到单位圆，避免 ±π 边界伪影
+        z_smooth = np.fft.ifft2(self._smooth_kernel * np.fft.fft2(z))
+        return np.angle(z_smooth)
     
     def load_and_preprocess(self, image_path, target_size=None):
         """
@@ -106,6 +133,14 @@ class PhaseExtractor:
             # 反向: 像面 → SLM
             u1_new = np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(u2_new)))
             phase_slm = np.angle(u1_new)
+            
+            # 平滑约束：将相位向其平滑版本混合，降低空间熵（抑制高频随机性）
+            if self.smoothness > 0:
+                phase_smooth = self._smooth_phase(phase_slm)
+                # 在单位圆上混合后再取角度，正确处理 ±π 环绕
+                z = (1.0 - self.smoothness) * np.exp(1j * phase_slm) + \
+                    self.smoothness * np.exp(1j * phase_smooth)
+                phase_slm = np.angle(z)
         
         if self.verbose:
             print(f"✓ GS完成!")

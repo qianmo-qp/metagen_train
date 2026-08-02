@@ -59,14 +59,14 @@ def _process_batch_worker(args):
     多进程 worker：处理一个 batch 的图像
 
     参数:
-        args: (images_slice, labels_slice, start_idx, resolution, iterations)
+        args: (images_slice, labels_slice, start_idx, resolution, iterations, smoothness)
 
     返回:
         (start_idx, phase_data, labels_slice)
     """
-    images_slice, labels_slice, start_idx, resolution, iterations = args
+    images_slice, labels_slice, start_idx, resolution, iterations, smoothness = args
 
-    extractor = PhaseExtractor(resolution, iterations, verbose=False)
+    extractor = PhaseExtractor(resolution, iterations, verbose=False, smoothness=smoothness)
     batch_size = len(images_slice)
     phase_data = np.zeros((batch_size, resolution, resolution), dtype=np.float32)
 
@@ -80,7 +80,8 @@ class OptimizedPhaseConverter:
     """优化版本的相位转换处理器"""
 
     def __init__(self, mnist_data_dir, output_dir, resolution=64, iterations=200,
-                 num_workers=8, chunk_size=2500, use_threads=False, verbose=True):
+                 num_workers=8, chunk_size=2500, use_threads=False, verbose=True,
+                 smoothness=0.0):
         """
         参数:
             mnist_data_dir: MNIST 数据集目录
@@ -92,6 +93,8 @@ class OptimizedPhaseConverter:
             use_threads: 是否使用多线程（默认 False，使用多进程）。
                          GS 迭代是 CPU 密集型任务，多进程通常更快；仅当进程启动开销过大时启用多线程。
             verbose: 是否打印详细信息
+            smoothness: GS 相位平滑约束强度 [0, 1]（0=关闭，推荐 0.3~0.6）。
+                        降低相位空间熵，使扩散模型更易学习。
         """
         self.mnist_data_dir = mnist_data_dir
         self.output_dir = output_dir
@@ -101,6 +104,7 @@ class OptimizedPhaseConverter:
         self.chunk_size = chunk_size
         self.use_threads = use_threads
         self.verbose = verbose
+        self.smoothness = float(smoothness)
 
     # ======================== IDX 格式读取 ========================
 
@@ -211,6 +215,7 @@ class OptimizedPhaseConverter:
                 start_idx,
                 self.resolution,
                 self.iterations,
+                self.smoothness,
             ))
 
         # 收集每个 batch 的结果并按 start_idx 排序
@@ -356,6 +361,7 @@ class OptimizedPhaseConverter:
             print(f"  输出目录: {self.output_dir}")
             print(f"  相位分辨率: {self.resolution}×{self.resolution}")
             print(f"  GS 迭代次数: {self.iterations}")
+            print(f"  相位平滑约束: {self.smoothness}")
             print(f"  并行方式: {'多线程' if self.use_threads else '多进程'}")
             print(f"  Worker 数量: {self.num_workers}")
             print(f"  文件分块大小: {self.chunk_size} 样本/文件")
@@ -433,6 +439,8 @@ def main():
                        help='相位处理分辨率 (默认: 64，可选 64/128/256)')
     parser.add_argument('--iterations', '-i', type=int, default=200,
                        help='GS 迭代次数 (默认: 200)')
+    parser.add_argument('--smoothness', '-s', type=float, default=0.0,
+                       help='GS 相位平滑约束强度 [0,1] (默认: 0=关闭，推荐 0.3~0.6，降低相位熵助扩散模型学习)')
     parser.add_argument('--workers', '-w', type=int, default=8,
                        help='并行 worker 数量 (默认: 8)')
     parser.add_argument('--chunk-size', type=int, default=2500,
@@ -454,7 +462,8 @@ def main():
         args.workers,
         args.chunk_size,
         use_threads=args.use_threads,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        smoothness=args.smoothness
     )
 
     if args.verify_only:
